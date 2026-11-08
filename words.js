@@ -68,6 +68,24 @@ module.exports = {
       'Dschungel', 'Hagel', 'Klippe', 'Tulpe', 'Geysir', 'Moor',
     ],
   },
+  minecraft: {
+    label: 'Minecraft',
+    words: [
+      'Creeper', 'Enderman', 'Steve', 'Herobrine', 'Zombie', 'Skelett', 'Ghast', 'Lohe', 'Enderdrache',
+      'Wither', 'Dorfbewohner', 'Eisengolem', 'Diamant', 'Redstone', 'Obsidian', 'Smaragd', 'Spitzhacke',
+      'Werkbank', 'Ofen', 'Truhe', 'Bett', 'TNT', 'Fackel', 'Lore', 'Elytra', 'Nether', 'Das Ende',
+      'Portal', 'Mine', 'Kolben',
+    ],
+  },
+  pokemon: {
+    label: 'Pokémon',
+    words: [
+      'Pikachu', 'Glurak', 'Bisasam', 'Schiggy', 'Evoli', 'Relaxo', 'Mewtu', 'Mew', 'Gengar', 'Enton',
+      'Karpador', 'Garados', 'Pummeluff', 'Mauzi', 'Rattfratz', 'Taubsi', 'Onix', 'Lavados', 'Arktos',
+      'Zapdos', 'Lucario', 'Quajutsu', 'Pokéball', 'Pokédex', 'Arena', 'Trainer', 'Orden', 'Team Rocket',
+      'Professor Eich', 'Pokémon-Center',
+    ],
+  },
   internet: {
     label: 'Gaming & Internet',
     words: [

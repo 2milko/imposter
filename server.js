@@ -3,7 +3,8 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { GameError, createRoom, getRoom, sweepRooms } = require('./game');
+const { GameError } = require('./errors');
+const { identify, createRoom, getRoom, sweepRooms } = require('./game');
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 4096;
@@ -15,6 +16,8 @@ const STATIC_FILES = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+  '/avatar.js': ['avatar.js', 'text/javascript; charset=utf-8'],
+  '/sounds.js': ['sounds.js', 'text/javascript; charset=utf-8'],
   '/favicon.svg': ['favicon.svg', 'image/svg+xml'],
 };
 
@@ -62,7 +65,7 @@ function readJson(req) {
   });
 }
 
-function authenticate(code, token) {
+function authenticatePlayer(code, token) {
   const room = getRoom(code);
   const player = room.findByToken(token);
   if (!player) throw new GameError('Du bist nicht in diesem Raum.', 403);
@@ -70,7 +73,7 @@ function authenticate(code, token) {
 }
 
 function openEventStream(req, res, url) {
-  const { room, player } = authenticate(url.searchParams.get('code'), url.searchParams.get('token'));
+  const { room, player } = authenticatePlayer(url.searchParams.get('code'), url.searchParams.get('token'));
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -107,23 +110,23 @@ async function handleApi(req, res, url) {
   const body = await readJson(req);
   switch (url.pathname) {
     case '/api/create': {
-      const { room, player } = createRoom(body.name);
+      const { room, player } = createRoom(identify(body));
       sendJson(res, 201, { code: room.code, token: player.token });
       return;
     }
     case '/api/join': {
       const room = getRoom(body.code);
-      const player = room.addPlayer(body.name);
+      const player = room.addPlayer(identify(body));
       sendJson(res, 200, { code: room.code, token: player.token });
       return;
     }
     case '/api/check': {
-      authenticate(body.code, body.token);
+      authenticatePlayer(body.code, body.token);
       sendJson(res, 200, { ok: true });
       return;
     }
     case '/api/action': {
-      const { room, player } = authenticate(body.code, body.token);
+      const { room, player } = authenticatePlayer(body.code, body.token);
       const { code: _code, token: _token, ...action } = body;
       room.handleAction(player, action);
       sendJson(res, 200, { ok: true });
@@ -135,7 +138,7 @@ async function handleApi(req, res, url) {
 }
 
 function serveStatic(req, res, url) {
-  const file = STATIC_FILES[url.pathname];
+  const file = Object.hasOwn(STATIC_FILES, url.pathname) ? STATIC_FILES[url.pathname] : null;
   if (!file || (req.method !== 'GET' && req.method !== 'HEAD')) {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Nicht gefunden');
