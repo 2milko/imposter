@@ -11,15 +11,17 @@ Wort-Partyspiel für den Browser, gemacht zum Spielen über Discord. Alle bekomm
 3. Der Host wählt die Anzahl der Runden, die Anzahl der Imposter und die Kategorie und startet das Spiel. Während der Runde sehen alle, wie viele Imposter dabei sind, aber nicht, wer es ist. Mindestens ein Spieler kennt immer das Wort.
 4. Jeder deckt seine eigene Karte auf: entweder das Wort oder „Du bist Imposter“.
 5. Das Spiel lost aus, wer anfängt, und zeigt die Reihenfolge. Wer dran ist, sagt sein Wort im Voice-Chat und schreibt es auf der Seite auf. So kann jeder jederzeit nachlesen, was die anderen gesagt haben.
-6. Sobald ihr bereit seid, startet der Host die Abstimmung. Danach werden Wort, Imposter und Stimmen aufgedeckt.
-7. Nach der letzten Runde zeigt das Endergebnis, wer gewonnen hat.
+   Für jedes Wort gibt es 30 Sekunden, danach ist automatisch der Nächste dran. Eingetippte Wörter liest der Browser vor. Mit einem Klick auf einen Mitspieler zeigt man allen, dass man ihn verdächtig findet.
+6. Ein Imposter kann jederzeit das Wort raten. Exakte Treffer und kleine Tippfehler zählen automatisch, über alles andere entscheiden die Spieler, die das Wort kennen (bei Gleichstand zählt der Tipp). Richtig: Die Imposter gewinnen. Falsch: Die Gruppe gewinnt. Beides beendet die Runde sofort.
+7. Sonst startet der Host die Abstimmung, sobald ihr bereit seid. Wer die meisten Stimmen hat, fliegt raus und entscheidet selbst, ob die eigene Rolle gezeigt wird. Bei Gleichstand fliegt niemand raus. Danach spielt ihr weiter, bis alle Imposter draußen sind (die Gruppe gewinnt) oder die Imposter mindestens so viele sind wie die übrigen Spieler (die Imposter gewinnen). Am Ende werden Wort, Imposter und Stimmen aufgedeckt.
+8. Nach der letzten Runde zeigt das Endergebnis, wer gewonnen hat.
 
 ## Punkte
 
 - Richtig abgestimmt: **10 Punkte**
 - Imposter gewinnt: **25 Punkte** für den Imposter
 
-Bei Gleichstand wird niemand enttarnt, das zählt als Sieg für den Imposter. Bei mehreren Impostern reicht es, wenn die Gruppe einen von ihnen enttarnt: Dann gehen alle Imposter leer aus. Name, Charakter und Stats wie Siege und Stimmen-Quote bleiben im Browser des jeweiligen Spielers gespeichert. Sie gelten also pro Browser und gehen verloren, wenn man die Browserdaten löscht.
+Punkte werden erst am Ende der Runde vergeben, damit die Rangliste keine Rollen verrät. Jede Stimme für einen Imposter zählt, auch über mehrere Abstimmungen. Gewinnen die Imposter, bekommen auch rausgewählte Imposter ihre 25 Punkte. In der Lobby lässt sich außerdem einstellen, ob sich mehrere Imposter gegenseitig sehen. Name, Charakter und Stats wie Siege und Stimmen-Quote bleiben im Browser des jeweiligen Spielers gespeichert. Sie gelten also pro Browser und gehen verloren, wenn man die Browserdaten löscht.
 
 ## Lokal starten
 

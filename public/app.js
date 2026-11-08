@@ -2,11 +2,13 @@
 
 const { PARTS, avatarMarkup, swatchColor, isValidAvatar, randomAvatar } = window.ImposterAvatar;
 const Sound = window.ImposterSound;
+const Speech = window.ImposterSpeech;
 
 const appEl = document.getElementById('app');
 const bannerEl = document.getElementById('banner');
 const toastEl = document.getElementById('toast');
 const soundToggleEl = document.getElementById('sound-toggle');
+const speechToggleEl = document.getElementById('speech-toggle');
 const RECONNECT_DELAY_MS = 2000;
 const SESSION_KEY = 'imposter-session';
 const SLOT_KEY = 'imposter-slot';
@@ -25,6 +27,10 @@ let profileOpen = false;       // Profil liegt über Startseite oder Lobby
 let profileDraft = null;       // Name und Avatar, die gerade bearbeitet werden
 let cardRevealedFor = null;    // ID der Runde, deren Karte aufgedeckt ist
 let wordDraft = '';            // Halb getipptes Wort übersteht neue Spielstände
+let guessOpen = false;         // Formular zum Raten des Wortes ist offen
+let guessDraft = '';
+let turnDeadline = 0;          // Ende des aktuellen Zuges in der Zeit dieses Browsers
+let lastTickSecond = null;
 let lastScreen = null;
 let landingMessage = null;
 let toastTimer = null;
@@ -101,8 +107,8 @@ function recordStats(current) {
   stats.points += gain.points;
   if (gain.wasImposter) stats.imposterRounds++;
   if (gain.imposterWon) stats.imposterWins++;
-  if (gain.voted) stats.votesCast++;
-  if (gain.correctVote) stats.correctVotes++;
+  stats.votesCast += gain.votesCast;
+  stats.correctVotes += gain.correctVotes;
   if (current.match.current >= current.match.total) {
     stats.matchesPlayed++;
     if (current.match.winners.includes(current.you.id)) stats.matchesWon++;
@@ -122,7 +128,7 @@ function h(tag, props = {}, ...children) {
     else if (key === 'key') el.dataset.key = value;
     else if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
     else if (key === 'value') el.value = value;
-    else if (key === 'disabled' || key === 'selected' || key === 'required') el[key] = Boolean(value);
+    else if (key === 'disabled' || key === 'selected' || key === 'required' || key === 'checked') el[key] = Boolean(value);
     else el.setAttribute(key, value);
   }
   for (const child of children.flat()) {
@@ -202,7 +208,9 @@ function connect() {
     const previous = view;
     view = JSON.parse(event.data);
     recordStats(view);
+    syncRoundState(previous, view);
     playTransitionSounds(previous, view);
+    speakNewWords(previous, view);
     render();
   });
 
@@ -259,6 +267,46 @@ async function leaveRoom() {
   resetToHome();
 }
 
+// --- Abgleich mit dem Server -----------------------------------------------------
+
+function syncRoundState(previous, next) {
+  if (previous?.round?.id !== next.round?.id) {
+    guessOpen = false;
+    guessDraft = '';
+  }
+  const wasYourTurn = previous?.round?.currentId === next.you.id;
+  if (wasYourTurn && next.round?.currentId !== next.you.id) wordDraft = '';
+  // Der Server schickt die Restzeit statt einer Uhrzeit, weil Uhren abweichen können.
+  if (next.phase === 'play') turnDeadline = Date.now() + next.round.turnEndsIn;
+}
+
+function speakNewWords(previous, next) {
+  if (!previous?.round || previous.round.id !== next.round?.id) return;
+  for (const entry of next.round.words.slice(previous.round.words.length)) {
+    if (entry.word) Speech.speak(entry.word);
+  }
+  if (next.phase === 'guess' && previous.phase !== 'guess') Speech.speak(next.round.guess.text);
+  if (next.phase === 'reveal' && previous.phase !== 'guess' && next.round.reveal.guess) {
+    Speech.speak(next.round.reveal.guess.text);
+  }
+}
+
+function updateTurnTimer() {
+  const timer = appEl.querySelector('.turn-timer');
+  if (!timer || view?.phase !== 'play') return;
+  const remaining = Math.max(0, turnDeadline - Date.now());
+  const seconds = Math.ceil(remaining / 1000);
+  timer.querySelector('.turn-seconds').textContent = String(seconds);
+  timer.querySelector('.turn-bar-fill').style.width = `${(remaining / view.round.turnLength) * 100}%`;
+  timer.classList.toggle('is-low', seconds <= 10);
+  if (view.round.currentId === view.you.id && seconds > 0 && seconds <= 5 && seconds !== lastTickSecond) {
+    Sound.play('tick');
+  }
+  lastTickSecond = seconds;
+}
+
+setInterval(updateTurnTimer, 200);
+
 // --- Sounds zu Spielereignissen ----------------------------------------------
 
 function playTransitionSounds(previous, next) {
@@ -285,7 +333,14 @@ function playTransitionSounds(previous, next) {
   if (next.phase === 'vote' && previous.phase === 'vote') {
     if (nextRound.vote.votedIds.length > prevRound.vote.votedIds.length) Sound.play('tick');
   }
-  if (next.phase === 'reveal' && previous.phase === 'vote') {
+  if (next.phase === 'guess' && previous.phase !== 'guess') Sound.play('imposterSting');
+  if (next.phase === 'kicked' && previous.phase === 'vote') {
+    Sound.play(nextRound.kick.playerId ? 'imposterSting' : 'leave');
+  }
+  if (next.phase === 'kicked' && previous.phase === 'kicked' && nextRound.kick.choice !== prevRound.kick.choice) {
+    Sound.play(nextRound.kick.choice === 'shown' ? 'flip' : 'leave');
+  }
+  if (next.phase === 'reveal' && previous.phase !== 'reveal') {
     const { reveal } = nextRound;
     Sound.play(reveal.caught ? 'groupWin' : 'imposterWin');
     const yourGain = reveal.gains.find((g) => g.id === next.you.id)?.points ?? 0;
@@ -332,6 +387,8 @@ function render() {
     case 'lobby': renderLobby(); break;
     case 'play': renderPlay(); break;
     case 'vote': renderVote(); break;
+    case 'guess': renderGuess(); break;
+    case 'kicked': renderKicked(); break;
     case 'reveal': renderReveal(); break;
     case 'final': renderFinal(); break;
   }
@@ -586,7 +643,18 @@ function renderLobby() {
     : h('p', { class: 'settings-readout' },
         'Runden: ', h('b', {}, String(view.settings.rounds)),
         ' · Imposter: ', h('b', {}, String(imposters)),
-        ' · Kategorie: ', h('b', {}, categoryLabel));
+        ' · Kategorie: ', h('b', {}, categoryLabel),
+        imposters > 1 && [' · Imposter sehen sich: ', h('b', {}, view.settings.impostersKnow ? 'Ja' : 'Nein')]);
+
+  // Mit nur einem Imposter gibt es niemanden, den er sehen könnte.
+  const knowSetting = isHost && imposters > 1 && h('label', { class: 'toggle-row' },
+    h('input', {
+      type: 'checkbox',
+      key: 'imposters-know',
+      checked: view.settings.impostersKnow,
+      onchange: (event) => act('settings', { impostersKnow: event.target.checked }),
+    }),
+    'Imposter sehen sich gegenseitig');
 
   mount('lobby', h('div', { class: 'screen' },
     topbar(`${present.length} Spieler`),
@@ -607,6 +675,7 @@ function renderLobby() {
             p.id === view.you.id && h('span', { class: 'tag' }, 'Du'),
             p.id === view.hostId && h('span', { class: 'tag tag-host' }, 'Host'))))),
       settings,
+      knowSetting,
       isHost && view.maxImposters === 1 && h('p', { class: 'hint' }, 'Ab 3 Spielern kannst du mehr als einen Imposter einstellen.'),
       h('p', { class: 'hint' }, 'Richtig abgestimmt: 10 Punkte. Imposter gewinnt: 25 Punkte.')),
     h('div', { class: 'actions' },
@@ -659,32 +728,233 @@ function gameLayout(screenKey, mainChildren, gains) {
 
 // --- Reihenfolge und gesagte Wörter ----------------------------------------------
 
-function renderWordLog(round, { showCurrent = false } = {}) {
+function renderWordLog(round, { showCurrent = false, canMark = false } = {}) {
+  const youPlay = canMark && round.inRound && !round.youKicked;
   return h('section', { class: 'panel' },
     h('h2', { class: 'panel-title' }, 'Gesagte Wörter'),
+    youPlay && h('p', { class: 'hint' }, 'Klick auf einen Mitspieler, um ihn als verdächtig zu markieren.'),
     h('ol', { class: 'order' }, round.order.map((id, index) => {
       const player = playerOf(id);
       const isCurrent = showCurrent && id === round.currentId;
       const words = round.words.filter((entry) => entry.playerId === id);
+      const markers = round.sus.find((entry) => entry.id === id)?.by ?? [];
+      const isMine = markers.includes(view.you.id);
+      const kicked = round.kicked.find((entry) => entry.id === id);
+      const markable = youPlay && id !== view.you.id && player && !player.left && !kicked;
+      const kickedLabel = kicked && {
+        imposter: 'raus · Imposter',
+        word: 'raus · kein Imposter',
+      }[kicked.role];
+      const toggleMark = () => {
+        Sound.play('tick');
+        act('sus', { target: id });
+      };
       const classes = ['order-row'];
       if (isCurrent) classes.push('is-current');
       if (player?.left) classes.push('has-left');
-      return h('li', { class: classes.join(' '), 'aria-current': isCurrent ? 'true' : null },
+      if (markers.length > 0) classes.push('has-sus');
+      if (markable) classes.push('is-markable');
+      if (kicked) classes.push('is-kicked');
+      return h('li', {
+        class: classes.join(' '),
+        'aria-current': isCurrent ? 'true' : null,
+        onclick: markable ? toggleMark : null,
+      },
         h('span', { class: 'order-number' }, String(index + 1)),
         player ? avatarNode(player.avatar) : h('span'),
         h('div', { class: 'order-main' },
           h('div', { class: 'order-head' },
-            h('span', { class: 'order-name' }, nameOf(id)),
+            // Der Klick landet über die Zeile beim Umschalten, der Button macht es per Tastatur erreichbar.
+            markable
+              ? h('button', {
+                  class: 'order-name order-name-button',
+                  type: 'button',
+                  key: `sus-${id}`,
+                  'data-silent': 'true',
+                  'aria-pressed': String(isMine),
+                  'aria-label': isMine ? `${nameOf(id)}: Markierung entfernen` : `${nameOf(id)} als verdächtig markieren`,
+                }, nameOf(id))
+              : h('span', { class: 'order-name' }, nameOf(id)),
             id === view.you.id && h('span', { class: 'tag' }, 'Du'),
-            player && !player.online && !player.left && h('span', { class: 'tag' }, 'offline')),
+            player && !player.online && !player.left && h('span', { class: 'tag' }, 'offline'),
+            kicked && h('span', { class: 'tag tag-kicked' }, kickedLabel ?? 'raus'),
+            markers.length > 0 && h('span', {
+              class: 'sus-marks',
+              title: `Verdächtigt von ${markers.map(nameOf).join(', ')}`,
+            },
+              h('span', { class: 'sus-label' }, 'sus'),
+              markers.map((markerId) => {
+                const marker = playerOf(markerId);
+                return marker ? avatarNode(marker.avatar, 'xs') : null;
+              }))),
           words.length > 0
-            ? h('ul', { class: 'word-chips' }, words.map((entry) => (
-                entry.word === null
-                  ? h('li', { class: 'word-chip is-skipped', title: `Durchgang ${entry.lap}: übersprungen` }, 'übersprungen')
-                  : h('li', { class: 'word-chip', title: `Durchgang ${entry.lap}` }, entry.word)
-              )))
+            ? h('ul', { class: 'word-chips' }, words.map((entry) => {
+                if (entry.word !== null) return h('li', { class: 'word-chip', title: `Durchgang ${entry.lap}` }, entry.word);
+                const label = entry.reason === 'timeout' ? 'Zeit abgelaufen' : 'übersprungen';
+                return h('li', { class: 'word-chip is-skipped', title: `Durchgang ${entry.lap}: ${label}` }, label);
+              }))
             : h('span', { class: 'no-words' }, 'Noch kein Wort')));
     })));
+}
+
+// --- Wort raten ---------------------------------------------------------------
+
+function renderGuessControl() {
+  if (!guessOpen) {
+    return h('button', {
+      class: 'btn btn-wide',
+      type: 'button',
+      key: 'guess-open',
+      onclick: () => {
+        guessOpen = true;
+        render();
+        document.getElementById('guess-input')?.focus();
+      },
+    }, 'Wort raten');
+  }
+  return h('form', {
+    class: 'panel',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      const guess = guessDraft.trim();
+      if (!guess) {
+        fail('Schreib deinen Tipp auf.');
+        return;
+      }
+      await act('guess', { guess });
+    },
+  },
+    h('div', { class: 'field' },
+      h('label', { for: 'guess-input' }, 'Was ist das Wort?'),
+      h('input', {
+        id: 'guess-input',
+        key: 'guess-input',
+        maxlength: 40,
+        autocomplete: 'off',
+        spellcheck: 'false',
+        value: guessDraft,
+        oninput: (event) => { guessDraft = event.target.value; },
+      })),
+    h('p', { class: 'hint' }, 'Du hast nur einen Versuch, und alle sehen deinen Tipp. Liegst du falsch, gewinnt die Gruppe.'),
+    h('div', { class: 'actions-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit', key: 'guess-submit' }, 'Tipp abgeben'),
+      h('button', {
+        class: 'btn', type: 'button', key: 'guess-cancel',
+        onclick: () => { guessOpen = false; render(); },
+      }, 'Abbrechen')));
+}
+
+function canGuess(round) {
+  return round.card?.type === 'imposter' && !round.youKicked;
+}
+
+function renderTally(tally, imposterIds = []) {
+  return h('section', { class: 'panel' },
+    h('h2', { class: 'panel-title' }, 'Stimmen'),
+    h('div', { class: 'tally' }, (() => {
+      const highest = Math.max(1, ...tally.map((row) => row.count));
+      return tally.map((row) => {
+        const fill = h('span', { class: 'tally-fill' });
+        // Die Breite wird per JS gesetzt, weil die Sicherheitsregeln (CSP) Inline-Styles im HTML blockieren.
+        fill.style.width = `${(row.count / highest) * 100}%`;
+        return h('div', { class: `tally-row${imposterIds.includes(row.id) ? ' is-imposter' : ''}` },
+          h('div', { class: 'tally-head' },
+            h('span', {}, nameOf(row.id)),
+            h('span', { class: 'tally-count' }, String(row.count))),
+          h('div', { class: 'tally-bar' }, fill),
+          row.voters.length > 0 && h('div', { class: 'tally-voters' }, `von ${row.voters.map(nameOf).join(', ')}`));
+      });
+    })()));
+}
+
+// --- Rauswahl -------------------------------------------------------------------
+
+function renderKicked() {
+  const round = view.round;
+  const { kick } = round;
+  const isHost = view.you.isHost;
+  const kickedId = kick.playerId;
+  const isYou = kickedId === view.you.id;
+  const name = kickedId ? nameOf(kickedId) : '';
+  const role = round.kicked.find((entry) => entry.id === kickedId)?.role;
+  document.title = kickedId ? `${name} ist raus · Imposter` : 'Niemand ist raus · Imposter';
+
+  let headline;
+  if (!kickedId) headline = 'Niemand fliegt raus';
+  else headline = isYou ? 'Du wurdest rausgewählt' : `${name} wurde rausgewählt`;
+
+  let status = null;
+  if (!kickedId) {
+    status = h('p', { class: 'notice' }, 'Bei Gleichstand fliegt niemand raus. Es geht weiter.');
+  } else if (kick.choice === 'shown') {
+    status = h('p', { class: `role-result${role === 'imposter' ? ' is-imposter' : ''}` }, role === 'imposter'
+      ? `${isYou ? 'Du warst' : `${name} war`} Imposter!`
+      : `${isYou ? 'Du warst' : `${name} war`} kein Imposter.`);
+  } else if (kick.choice === 'hidden') {
+    status = h('p', { class: 'notice' }, isYou ? 'Du behältst deine Rolle für dich.' : `${name} behält die Rolle für sich.`);
+  } else if (isYou) {
+    status = h('section', { class: 'panel' },
+      h('p', {}, 'Willst du den anderen deine Rolle zeigen?'),
+      h('div', { class: 'actions-row' },
+        h('button', { class: 'btn btn-primary', key: 'role-show', onclick: () => act('revealRole', { show: true }) }, 'Rolle zeigen'),
+        h('button', { class: 'btn', key: 'role-hide', onclick: () => act('revealRole', { show: false }) }, 'Geheim halten')));
+  } else {
+    status = h('p', { class: 'notice' }, `${name} entscheidet, ob die Rolle gezeigt wird.`);
+  }
+
+  const waitingForChoice = kickedId && kick.choice === null;
+  gameLayout(`kicked-${round.id}-${round.kicked.length}-${round.words.length}`, [
+    gameTopbar('Abstimmung vorbei'),
+    h('section', { class: 'speaker' },
+      h('div', { class: 'panel-title' }, 'Ergebnis'),
+      h('h1', { class: 'speaker-name' }, headline)),
+    status,
+    isHost
+      ? h('button', {
+          class: waitingForChoice ? 'btn btn-wide' : 'btn btn-primary btn-wide',
+          key: 'continue',
+          onclick: () => act('continueRound'),
+        }, waitingForChoice ? 'Nicht warten, weiterspielen' : 'Weiterspielen')
+      : h('p', { class: 'hint' }, `${nameOf(view.hostId)} macht gleich weiter.`),
+    renderTally(kick.tally),
+    renderWordLog(round),
+  ]);
+}
+
+// --- Wort raten: Prüfung ----------------------------------------------------------
+
+function renderGuess() {
+  const round = view.round;
+  const { playerId, text, judges, doneCount, yours } = round.guess;
+  const isJudge = judges.includes(view.you.id);
+  const guesser = nameOf(playerId);
+  document.title = `${guesser} hat getippt · Imposter`;
+
+  const verdictButton = (accepted, label, primary) => h('button', {
+    class: `btn${primary ? ' btn-primary' : ''}${yours === accepted ? ' is-chosen' : ''}`,
+    key: `judge-${accepted}`,
+    'aria-pressed': String(yours === accepted),
+    onclick: () => act('judgeGuess', { accepted }),
+  }, label);
+
+  gameLayout(`guess-${round.id}`, [
+    gameTopbar(`${doneCount} von ${judges.length} entschieden`),
+    h('section', { class: 'speaker' },
+      h('div', { class: 'panel-title' }, playerId === view.you.id ? 'Dein Tipp' : `${guesser} ist Imposter und tippt`),
+      h('h1', { class: 'guess-text' }, `„${text}“`)),
+    isJudge
+      ? h('section', { class: 'panel' },
+          h('p', {}, 'Euer Wort ist ', h('b', {}, round.card.word), '. Zählt der Tipp als richtig?'),
+          h('div', { class: 'actions-row' },
+            verdictButton(true, 'Zählt', true),
+            verdictButton(false, 'Zählt nicht', false)),
+          h('p', { class: 'hint' }, 'Auch ähnliche Begriffe dürfen zählen. Bei Gleichstand ist der Tipp richtig.'))
+      : h('p', { class: 'notice' }, 'Die Spieler, die das Wort kennen, entscheiden jetzt, ob der Tipp zählt.'),
+    view.you.isHost && h('button', {
+      class: 'btn btn-wide', key: 'finishGuess', onclick: () => act('finishGuess'),
+    }, 'Jetzt auswerten'),
+    renderWordLog(round),
+  ]);
 }
 
 // --- Spielrunde ---------------------------------------------------------------
@@ -714,6 +984,8 @@ function renderCard(round) {
         card.setAttribute('aria-label', labelFor(nowRevealed));
         Sound.play('flip');
         if (nowRevealed && isImposter) Sound.play('imposterSting', 0.18);
+        const slot = document.getElementById('guess-slot');
+        if (slot) slot.hidden = !nowRevealed;
       },
     },
       h('span', { class: 'card-face card-back' },
@@ -723,7 +995,9 @@ function renderCard(round) {
       h('span', { class: `card-face card-front${isImposter ? ' is-imposter' : ''}` },
         h('span', { class: 'card-front-label' }, isImposter ? 'Pssst …' : 'Dein Wort'),
         h('span', { class: 'card-word', lang: 'de' }, isImposter ? 'Du bist Imposter' : round.card.word),
-        h('span', { class: 'card-front-hint' }, isImposter ? 'Hör gut zu und tu so, als wüsstest du das Wort' : 'Tippen zum Verdecken'))));
+        h('span', { class: 'card-front-hint' }, isImposter && round.partners?.length
+          ? `Mit dir im Team: ${round.partners.map(nameOf).join(', ')}`
+          : (isImposter ? 'Hör gut zu und tu so, als wüsstest du das Wort' : 'Tippen zum Verdecken')))));
 }
 
 function renderWordForm(round) {
@@ -759,7 +1033,7 @@ function imposterCountNote(round) {
   const count = round.imposterCount;
   return h('p', { class: 'imposter-count' },
     h('strong', {}, String(count)),
-    count === 1 ? ' Imposter ist unter euch' : ' Imposter sind unter euch');
+    ' Imposter in dieser Runde');
 }
 
 function renderPlay() {
@@ -776,13 +1050,22 @@ function renderPlay() {
     round.card
       ? renderCard(round)
       : h('p', { class: 'notice' }, 'Du bist mitten in der Runde dazugekommen und spielst ab der nächsten mit.'),
-    h('section', { class: `speaker${isYourTurn ? ' is-you' : ''}`, 'aria-live': 'polite' },
-      h('div', { class: 'panel-title' }, round.isFirstTurn ? 'Per Zufall ausgewählt' : 'Gerade dran'),
-      h('div', { class: 'speaker-name' }, isYourTurn
-        ? (round.isFirstTurn ? 'Du fängst an!' : 'Du bist dran!')
-        : (round.isFirstTurn ? `${current} fängt an` : `${current} ist dran`))),
+    round.youKicked && h('p', { class: 'notice' }, 'Du wurdest rausgewählt und schaust nur noch zu. Verrate bitte nichts.'),
+    // Bleibt verborgen, solange die Karte zu ist, damit ein geteilter Bildschirm den Imposter nicht verrät.
+    canGuess(round) && h('div', {
+      id: 'guess-slot', hidden: cardRevealedFor !== round.id ? '' : null,
+    }, renderGuessControl()),
+    h('section', { class: 'speaker-row' },
+      h('div', { class: `speaker${isYourTurn ? ' is-you' : ''}`, 'aria-live': 'polite' },
+        h('div', { class: 'panel-title' }, round.isFirstTurn ? 'Per Zufall ausgewählt' : 'Gerade dran'),
+        h('div', { class: 'speaker-name' }, isYourTurn
+          ? (round.isFirstTurn ? 'Du fängst an!' : 'Du bist dran!')
+          : (round.isFirstTurn ? `${current} fängt an` : `${current} ist dran`))),
+      h('div', { class: 'turn-timer', 'aria-hidden': 'true' },
+        h('span', { class: 'turn-seconds' }),
+        h('div', { class: 'turn-bar' }, h('span', { class: 'turn-bar-fill' })))),
     isYourTurn && h('section', { class: 'panel' }, renderWordForm(round)),
-    renderWordLog(round, { showCurrent: true }),
+    renderWordLog(round, { showCurrent: true, canMark: true }),
     isHost
       ? h('div', { class: 'actions-row' },
           h('button', { class: 'btn btn-primary', key: 'startVote', onclick: () => act('startVote') }, 'Abstimmung starten'),
@@ -794,6 +1077,7 @@ function renderPlay() {
     h('button', { class: 'btn-link', onclick: leaveRoom }, 'Raum verlassen'),
   ]);
 
+  updateTurnTimer();
   // Wer an die Reihe kommt, kann sofort lostippen, solange kein anderes Element den Fokus hat.
   if (isYourTurn && !focusedBefore) document.getElementById('word-input')?.focus({ preventScroll: true });
 }
@@ -831,16 +1115,18 @@ function renderVote() {
           },
             avatarNode(player.avatar),
             h('span', { class: 'vote-name' }, player.name),
+            round.partners?.includes(id) && h('span', { class: 'tag' }, 'Dein Team'),
             h('span', { class: 'vote-state' }, isSelf ? 'Du' : isSelected ? 'Deine Stimme' : votedIds.includes(id) ? 'hat abgestimmt' : ''));
         }))
       : h('p', { class: 'notice' }, 'Du schaust in dieser Runde nur zu.'),
     canVote && h('p', { class: 'hint' }, yours
       ? 'Du kannst deine Stimme noch ändern, bis alle abgestimmt haben.'
-      : 'Richtig abgestimmt gibt 10 Punkte. Bei Gleichstand gewinnt der Imposter.'),
+      : 'Wer die meisten Stimmen hat, fliegt raus. Bei Gleichstand niemand. Punkte gibt es am Ende der Runde.'),
     view.you.isHost && h('button', {
       class: 'btn btn-wide', key: 'finishVote', onclick: () => act('finishVote'),
     }, 'Jetzt auswerten'),
-    renderWordLog(round),
+    canGuess(round) && renderGuessControl(),
+    renderWordLog(round, { canMark: true }),
   ]);
 }
 
@@ -853,29 +1139,46 @@ function renderReveal() {
   const imposterNames = reveal.imposterIds.map(nameOf).join(', ');
   const plural = reveal.imposterIds.length > 1;
   const youWereImposter = reveal.imposterIds.includes(view.you.id);
-  const highest = Math.max(1, ...reveal.tally.map((row) => row.count));
   const isLastRound = view.match.current >= view.match.total;
   const yourGain = reveal.gains.find((g) => g.id === view.you.id);
   document.title = 'Auflösung · Imposter';
 
   let detail;
   if (reveal.accusedId === null) detail = 'Ihr konntet euch auf niemanden einigen.';
-  else if (groupWon) detail = `${nameOf(reveal.accusedId)} wurde enttarnt.`;
-  else detail = `Ihr habt ${nameOf(reveal.accusedId)} verdächtigt. Falsch!`;
+  else if (groupWon) detail = 'Alle Imposter sind draußen.';
+  else if (reveal.imposterIds.includes(reveal.accusedId)) {
+    detail = `${nameOf(reveal.accusedId)} wurde enttarnt, aber die Imposter sind in der Überzahl.`;
+  } else {
+    detail = `${nameOf(reveal.accusedId)} war unschuldig. Jetzt sind die Imposter in der Überzahl.`;
+  }
+
+  let title;
+  if (groupWon) title = youWereImposter ? 'Erwischt!' : 'Die Gruppe gewinnt!';
+  else if (youWereImposter) title = 'Du hast gewonnen!';
+  else title = plural ? 'Die Imposter gewinnen!' : 'Der Imposter gewinnt!';
+
+  const { guess } = reveal;
+  if (guess) {
+    const guesser = nameOf(guess.playerId);
+    const isYou = guess.playerId === view.you.id;
+    if (guess.correct) title = isYou ? 'Richtig geraten!' : `${guesser} hat das Wort erraten!`;
+    else title = isYou ? 'Falsch geraten!' : `${guesser} hat falsch geraten!`;
+    detail = `Der Tipp war „${guess.text}“.`;
+    if (guess.judged) detail += guess.correct ? ' Die Gruppe lässt ihn gelten.' : ' Die Gruppe lässt ihn nicht gelten.';
+  }
 
   gameLayout(`reveal-${round.id}`, [
     gameTopbar('Auflösung'),
     h('section', { class: `verdict${groupWon ? ' group-won' : ''}` },
-      h('h1', { class: 'verdict-title' }, groupWon
-        ? (youWereImposter ? 'Erwischt!' : 'Die Gruppe gewinnt!')
-        : (youWereImposter ? 'Du hast gewonnen!' : (plural ? 'Die Imposter gewinnen!' : 'Der Imposter gewinnt!'))),
+      h('h1', { class: 'verdict-title' }, title),
       h('p', {}, detail)),
     yourGain && h('section', { class: 'panel' },
       yourGain.points > 0
         ? h('p', { class: 'gain-line' }, `+${yourGain.points} Punkte`,
             h('span', { class: 'hint' }, ` (${[
               yourGain.imposterWon && 'Imposter-Sieg',
-              yourGain.correctVote && 'richtige Stimme',
+              yourGain.correctVotes === 1 && 'richtige Stimme',
+              yourGain.correctVotes > 1 && `${yourGain.correctVotes} richtige Stimmen`,
             ].filter(Boolean).join(', ')})`))
         : h('p', { class: 'gain-line is-zero' }, 'Diese Runde keine Punkte für dich.')),
     h('section', { class: 'panel reveal-facts' },
@@ -895,24 +1198,10 @@ function renderReveal() {
       : h('p', { class: 'hint' }, isLastRound
           ? `${nameOf(view.hostId)} öffnet gleich das Endergebnis.`
           : `${nameOf(view.hostId)} startet die nächste Runde.`),
-    h('section', { class: 'panel' },
-      h('h2', { class: 'panel-title' }, 'Stimmen'),
-      h('div', { class: 'tally' }, reveal.tally.map((row) =>
-        h('div', { class: `tally-row${reveal.imposterIds.includes(row.id) ? ' is-imposter' : ''}` },
-          h('div', { class: 'tally-head' },
-            h('span', {}, nameOf(row.id)),
-            h('span', { class: 'tally-count' }, String(row.count))),
-          h('div', { class: 'tally-bar' },
-            h('span', { class: 'tally-fill', 'data-width': String((row.count / highest) * 100) })),
-          row.voters.length > 0 && h('div', { class: 'tally-voters' }, `von ${row.voters.map(nameOf).join(', ')}`))))),
+    reveal.tally.length > 0 && renderTally(reveal.tally, reveal.imposterIds),
     renderWordLog(round),
     h('button', { class: 'btn-link', onclick: leaveRoom }, 'Raum verlassen'),
   ], reveal.gains);
-
-  // Die Breite wird per JS gesetzt, weil die Sicherheitsregeln (CSP) Inline-Styles im HTML blockieren.
-  for (const bar of appEl.querySelectorAll('.tally-fill')) {
-    bar.style.width = `${bar.dataset.width}%`;
-  }
 }
 
 // --- Endergebnis ----------------------------------------------------------------
@@ -962,7 +1251,18 @@ function updateSoundToggle() {
   soundToggleEl.textContent = muted ? 'Ton aus' : 'Ton an';
   soundToggleEl.setAttribute('aria-pressed', String(muted));
   soundToggleEl.setAttribute('aria-label', muted ? 'Ton einschalten' : 'Ton ausschalten');
+
+  const speechMuted = Speech.isMuted();
+  speechToggleEl.textContent = speechMuted ? 'Sprache aus' : 'Sprache an';
+  speechToggleEl.setAttribute('aria-pressed', String(speechMuted));
+  speechToggleEl.setAttribute('aria-label', speechMuted ? 'Vorlesen einschalten' : 'Vorlesen ausschalten');
+  speechToggleEl.hidden = !Speech.isSupported();
 }
+
+speechToggleEl.addEventListener('click', () => {
+  Speech.setMuted(!Speech.isMuted());
+  updateSoundToggle();
+});
 
 soundToggleEl.addEventListener('click', () => {
   Sound.setMuted(!Sound.isMuted());

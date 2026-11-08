@@ -213,4 +213,38 @@
   }
 
   window.ImposterSound = { play, setMuted, isMuted: () => muted, defs };
+
+  // --- Sprachausgabe ---------------------------------------------------------
+
+  // Die Stimme kommt vom Browser beziehungsweise vom Betriebssystem.
+  const SPEECH_KEY = 'imposter-speech-muted';
+  const synth = window.speechSynthesis ?? null;
+  let speechMuted = false;
+  try {
+    speechMuted = localStorage.getItem(SPEECH_KEY) === '1';
+  } catch { /* Ohne Speicher gilt die Standardeinstellung. */ }
+
+  function speak(text) {
+    if (speechMuted || !synth) return;
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'de-DE';
+    const voice = synth.getVoices().find((candidate) => candidate.lang?.toLowerCase().startsWith('de'));
+    if (voice) utterance.voice = voice;
+    synth.speak(utterance);
+  }
+
+  function setSpeechMuted(value) {
+    speechMuted = value;
+    if (value) synth?.cancel();
+    try {
+      localStorage.setItem(SPEECH_KEY, value ? '1' : '0');
+    } catch { /* Gilt dann nur bis zum Neuladen. */ }
+  }
+
+  window.ImposterSpeech = {
+    speak,
+    setMuted: setSpeechMuted,
+    isMuted: () => speechMuted,
+    isSupported: () => Boolean(synth),
+  };
 })();
