@@ -2,6 +2,8 @@
 
 Wort-Partyspiel für den Browser, gemacht zum Spielen über Discord. Alle bekommen dasselbe Wort, nur der Imposter nicht. Ihr sagt reihum ein Wort dazu und stimmt dann ab, wer blufft.
 
+**Jetzt spielen:** https://imposter-u7fh.onrender.com
+
 ## So läuft eine Runde
 
 1. Eine Person erstellt einen Raum und schickt den Einladungslink in euren Discord. Ihr braucht mindestens 3 Spieler.
@@ -26,18 +28,11 @@ Danach läuft das Spiel auf http://localhost:3000. Zum Ausprobieren kannst du me
 npm test
 ```
 
-## Online stellen, damit deine Freunde mitspielen können
+## Online-Version
 
-Empfehlung: [Render](https://render.com), dort gibt es einen kostenlosen Tarif.
+Das Spiel läuft als kostenloser Web Service bei [Render](https://render.com), Region Frankfurt. Render holt den Code aus dem öffentlichen GitHub-Repo, verwendet `npm install` als Build Command und `npm start` als Start Command.
 
-1. Lade diesen Ordner in ein GitHub-Repository hoch.
-2. Lege bei Render einen neuen **Web Service** an und wähle das Repository aus.
-3. Trage diese Einstellungen ein:
-   - **Language:** Node
-   - **Build Command:** `npm install`
-   - **Start Command:** `npm start`
-   - **Instance Type:** Free
-4. Nach dem Deploy bekommst du eine Adresse wie `https://dein-name.onrender.com`. Die rufst du auf und erstellst dort einen Raum.
+**Änderungen veröffentlichen:** Render übernimmt neue Commits nicht automatisch. Lade die Änderung zuerst auf GitHub hoch und wähle dann im Render-Dashboard beim Dienst `imposter` unter **Manual Deploy** den Punkt **Deploy latest commit**. Dabei werden offene Räume beendet.
 
 Das solltest du zum kostenlosen Tarif wissen (Stand November 2026):
 
