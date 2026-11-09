@@ -60,7 +60,7 @@ Alle Befehle laufen auf dem Proxmox-Host:
 
 ```bash
 # Neue Version von GitHub holen und neu starten (offene Räume werden dabei beendet)
-pct exec 115 -- imposter-update
+pct exec 115 -- /usr/local/bin/imposter-update
 
 # Passwort zurücksetzen, wenn jemand es vergessen hat
 pct exec 115 -- runuser -u imposter -- env DATA_DIR=/var/lib/imposter node /opt/imposter/admin.js passwort NAME NEUESPASSWORT
