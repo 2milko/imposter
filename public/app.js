@@ -13,18 +13,22 @@ const RECONNECT_DELAY_MS = 2000;
 const SESSION_KEY = 'imposter-session';
 const SLOT_KEY = 'imposter-slot';
 
-// Mit ?spieler=2 in der Adresse bekommt ein Tab ein eigenes Profil. So lässt sich
+// Mit ?spieler=2 in der Adresse meldet sich ein Tab mit einem eigenen Konto an. So lässt sich
 // eine Runde mit mehreren Spielern in einem einzigen Browser üben.
 const slot = new URLSearchParams(location.search).get('spieler') ?? storageGet(sessionStorage, SLOT_KEY);
 if (slot) storageSet(sessionStorage, SLOT_KEY, slot);
-const PROFILE_KEY = slot ? `imposter-profile-${slot}` : 'imposter-profile';
+const TOKEN_KEY = slot ? `imposter-token-${slot}` : 'imposter-token';
+const OLD_PROFILE_KEY = slot ? `imposter-profile-${slot}` : 'imposter-profile';
 
-const profile = loadProfile(); // Name, Avatar und Stats dieses Browsers
+let accountToken = storageGet(localStorage, TOKEN_KEY);
+let account = null;            // Eigenes Konto mit Stats
+let authMode = storageGet(localStorage, OLD_PROFILE_KEY) ? 'register' : 'login';
+let leaderboard = null;        // Bestenliste aller Konten, wird beim Öffnen der Startseite geladen
 let session = loadSession();   // Raumsitzung: { code, token }
 let view = null;               // Letzter Spielstand vom Server
 let source = null;             // EventSource
 let profileOpen = false;       // Profil liegt über Startseite oder Lobby
-let profileDraft = null;       // Name und Avatar, die gerade bearbeitet werden
+let profileDraft = null;       // Avatar, der gerade bearbeitet wird
 let cardRevealedFor = null;    // ID der Runde, deren Karte aufgedeckt ist
 let wordDraft = '';            // Halb getipptes Wort übersteht neue Spielstände
 let guessOpen = false;         // Formular zum Raten des Wortes ist offen
@@ -53,68 +57,22 @@ function saveSession(value) {
   session = value;
   storageSet(sessionStorage, SESSION_KEY, value ? JSON.stringify(value) : null);
 }
-
-function randomClientId() {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+function saveAccountToken(value) {
+  accountToken = value;
+  storageSet(localStorage, TOKEN_KEY, value);
 }
 
-function emptyStats() {
-  return {
-    matchesPlayed: 0,
-    matchesWon: 0,
-    roundsPlayed: 0,
-    imposterRounds: 0,
-    imposterWins: 0,
-    votesCast: 0,
-    correctVotes: 0,
-    points: 0,
-  };
-}
-
-function loadProfile() {
-  let stored = null;
-  try { stored = JSON.parse(storageGet(localStorage, PROFILE_KEY)); } catch { /* Dann neu anlegen. */ }
-  const loaded = {
-    clientId: typeof stored?.clientId === 'string' ? stored.clientId : randomClientId(),
-    name: typeof stored?.name === 'string' ? stored.name : '',
-    avatar: isValidAvatar(stored?.avatar) ? stored.avatar : randomAvatar(),
-    stats: { ...emptyStats(), ...stored?.stats },
-    lastRoundKey: stored?.lastRoundKey ?? null,
-  };
-  storageSet(localStorage, PROFILE_KEY, JSON.stringify(loaded));
-  return loaded;
-}
-
-function saveProfile() {
-  storageSet(localStorage, PROFILE_KEY, JSON.stringify(profile));
-}
-
-function identity() {
-  return { clientId: profile.clientId, name: profile.name, avatar: profile.avatar };
-}
-
-// Trägt jede Runde genau einmal in die Stats ein, auch wenn man bei der Auflösung neu lädt.
-function recordStats(current) {
-  if (current.phase !== 'reveal') return;
-  const roundKey = `${current.code}:${current.round.id}`;
-  if (profile.lastRoundKey === roundKey) return;
-  const gain = current.round.reveal.gains.find((entry) => entry.id === current.you.id);
-  if (!gain) return;
-
-  const { stats } = profile;
-  stats.roundsPlayed++;
-  stats.points += gain.points;
-  if (gain.wasImposter) stats.imposterRounds++;
-  if (gain.imposterWon) stats.imposterWins++;
-  stats.votesCast += gain.votesCast;
-  stats.correctVotes += gain.correctVotes;
-  if (current.match.current >= current.match.total) {
-    stats.matchesPlayed++;
-    if (current.match.winners.includes(current.you.id)) stats.matchesWon++;
+// Profil aus der Zeit ohne Konten: Name und Avatar werden bei der Registrierung vorgeschlagen.
+function oldProfile() {
+  try {
+    const stored = JSON.parse(storageGet(localStorage, OLD_PROFILE_KEY));
+    return {
+      name: typeof stored?.name === 'string' ? stored.name : '',
+      avatar: isValidAvatar(stored?.avatar) ? stored.avatar : null,
+    };
+  } catch {
+    return { name: '', avatar: null };
   }
-  profile.lastRoundKey = roundKey;
-  saveProfile();
 }
 
 // --- DOM-Helfer -------------------------------------------------------------
@@ -169,6 +127,7 @@ function setBanner(message) {
 async function request(method, path, body) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (accountToken) headers.Authorization = `Bearer ${accountToken}`;
   let response;
   try {
     response = await fetch(path, {
@@ -207,7 +166,6 @@ function connect() {
     setBanner(null);
     const previous = view;
     view = JSON.parse(event.data);
-    recordStats(view);
     syncRoundState(previous, view);
     playTransitionSounds(previous, view);
     speakNewWords(previous, view);
@@ -259,6 +217,11 @@ function resetToHome(message = null) {
   document.title = 'Imposter';
   history.replaceState(null, '', '/');
   renderHome();
+  // Nach einem Spiel haben sich Stats und Bestenliste geändert.
+  if (account) {
+    refreshAccount().then(() => { if (!view && !profileOpen && account) renderHome(); });
+    loadLeaderboard();
+  }
 }
 
 async function leaveRoom() {
@@ -277,7 +240,7 @@ function syncRoundState(previous, next) {
   const wasYourTurn = previous?.round?.currentId === next.you.id;
   if (wasYourTurn && next.round?.currentId !== next.you.id) wordDraft = '';
   // Der Server schickt die Restzeit statt einer Uhrzeit, weil Uhren abweichen können.
-  if (next.phase === 'play') turnDeadline = Date.now() + next.round.turnEndsIn;
+  if (next.phase === 'play' && next.round.turnEndsIn !== null) turnDeadline = Date.now() + next.round.turnEndsIn;
 }
 
 function speakNewWords(previous, next) {
@@ -293,7 +256,7 @@ function speakNewWords(previous, next) {
 
 function updateTurnTimer() {
   const timer = appEl.querySelector('.turn-timer');
-  if (!timer || view?.phase !== 'play') return;
+  if (!timer || view?.phase !== 'play' || !view.round.turnLength) return;
   const remaining = Math.max(0, turnDeadline - Date.now());
   const seconds = Math.ceil(remaining / 1000);
   timer.querySelector('.turn-seconds').textContent = String(seconds);
@@ -367,7 +330,10 @@ function mount(screenKey, node, { game = false } = {}) {
   const target = appEl.querySelector(`[data-key="${CSS.escape(focusedKey)}"]`);
   if (!target) return;
   target.focus();
-  if (target.tagName === 'INPUT') target.setSelectionRange(target.value.length, target.value.length);
+  // Nur Textfelder haben einen Cursor, bei Häkchen wirft setSelectionRange einen Fehler.
+  if (target.tagName === 'INPUT' && ['text', 'search', 'password', ''].includes(target.getAttribute('type') ?? '')) {
+    target.setSelectionRange(target.value.length, target.value.length);
+  }
 }
 
 function playerOf(id) {
@@ -411,11 +377,86 @@ function wordmark() {
   return h('h1', { class: 'wordmark' }, 'Impos', h('span', {}, 'ter'));
 }
 
+// --- Anmeldung ----------------------------------------------------------------
+
+function renderAuth() {
+  document.title = 'Imposter';
+  const isRegister = authMode === 'register';
+  const previous = oldProfile();
+  const usernameInput = h('input', {
+    id: 'username', maxlength: 16, autocomplete: 'username', required: true, spellcheck: 'false',
+    value: isRegister ? previous.name.replace(/[^\p{L}\p{N}_-]/gu, '') : '',
+  });
+  const passwordInput = h('input', {
+    id: 'password', type: 'password', required: true, maxlength: 200,
+    autocomplete: isRegister ? 'new-password' : 'current-password',
+  });
+
+  const submit = async (event) => {
+    event.preventDefault();
+    try {
+      const body = { username: usernameInput.value, password: passwordInput.value };
+      if (isRegister) body.avatar = previous.avatar ?? randomAvatar();
+      const result = await post(isRegister ? '/api/register' : '/api/login', body);
+      saveAccountToken(result.token);
+      account = result.account;
+      landingMessage = null;
+      Sound.play('join');
+      if (isRegister) openProfile();
+      else renderHome();
+    } catch (error) {
+      fail(error.message);
+    }
+  };
+
+  const tab = (mode, label) => h('button', {
+    class: `tab${authMode === mode ? ' is-active' : ''}`,
+    type: 'button',
+    'aria-pressed': String(authMode === mode),
+    onclick: () => { authMode = mode; renderAuth(); },
+  }, label);
+
+  mount(`auth-${authMode}`, h('div', { class: 'screen' },
+    h('section', { class: 'hero' },
+      wordmark(),
+      h('p', { class: 'tagline' }, 'Alle kennen das Wort, nur einer nicht. Sagt reihum ein Wort dazu und findet heraus, wer blufft.')),
+    landingMessage && h('p', { class: 'notice' }, landingMessage),
+    h('section', { class: 'panel' },
+      h('div', { class: 'tabs' }, tab('login', 'Anmelden'), tab('register', 'Konto erstellen')),
+      h('form', { class: 'auth-form', onsubmit: submit },
+        h('div', { class: 'field' }, h('label', { for: 'username' }, 'Name'), usernameInput),
+        h('div', { class: 'field' }, h('label', { for: 'password' }, 'Passwort'), passwordInput),
+        isRegister && h('p', { class: 'hint' }, 'Keine E-Mail nötig. Merk dir dein Passwort gut, es lässt sich nur über den Server-Admin zurücksetzen.'),
+        h('button', { class: 'btn btn-primary btn-wide', type: 'submit' }, isRegister ? 'Konto erstellen' : 'Anmelden')))));
+  (isRegister && usernameInput.value ? passwordInput : usernameInput).focus();
+}
+
 // --- Startseite ---------------------------------------------------------------
 
+async function loadLeaderboard() {
+  try {
+    ({ leaderboard } = await request('GET', '/api/leaderboard'));
+    if (!view && !profileOpen && account) renderHome();
+  } catch { /* Dann bleibt die Bestenliste einfach weg. */ }
+}
+
+function renderLeaderboardPanel() {
+  if (!leaderboard?.length) return null;
+  return h('section', { class: 'panel' },
+    h('h2', { class: 'panel-title' }, 'Bestenliste'),
+    h('ol', { class: 'board' }, leaderboard.map((entry, index) => h('li', {
+      class: `board-row${entry.username === account.username ? ' is-you' : ''}${index === 0 ? ' is-first' : ''}`,
+    },
+      h('span', { class: 'board-rank' }, String(index + 1)),
+      avatarNode(entry.avatar),
+      h('span', { class: 'board-name' }, entry.username,
+        h('span', { class: 'board-sub' }, `${entry.matchesWon} von ${entry.matchesPlayed} Spielen gewonnen`)),
+      h('span', { class: 'board-points' }, h('span', { class: 'board-score' }, String(entry.points)))))));
+}
+
 function renderHome() {
-  if (!profile.name) {
-    openProfile();
+  if (!account) {
+    renderAuth();
     return;
   }
   document.title = 'Imposter';
@@ -425,9 +466,9 @@ function renderHome() {
     spellcheck: 'false', placeholder: 'ABCD', value: inviteCode,
   });
 
-  const enterRoom = async (path, body) => {
+  const enterRoom = async (path, body = {}) => {
     try {
-      const { code, token } = await post(path, { ...identity(), ...body });
+      const { code, token } = await post(path, body);
       saveSession({ code, token });
       landingMessage = null;
       history.replaceState(null, '', `/?r=${code}`);
@@ -464,13 +505,17 @@ function renderHome() {
       h('p', { class: 'tagline' }, 'Alle kennen das Wort, nur einer nicht. Sagt reihum ein Wort dazu und findet heraus, wer blufft.')),
     landingMessage && h('p', { class: 'notice' }, landingMessage),
     h('section', { class: 'panel account-bar' },
-      avatarNode(profile.avatar, 'md'),
+      avatarNode(account.avatar, 'md'),
       h('div', { class: 'account-bar-text' },
-        h('div', { class: 'account-bar-name' }, profile.name),
-        h('button', { class: 'btn-link', type: 'button', onclick: openProfile }, 'Profil bearbeiten'))),
+        h('div', { class: 'account-bar-name' }, account.username),
+        h('div', { class: 'hint' }, `${account.stats.points} Punkte · ${account.stats.matchesWon} Siege`),
+        h('div', { class: 'link-row link-row-start' },
+          h('button', { class: 'btn-link', type: 'button', onclick: openProfile }, 'Profil & Stats'),
+          h('button', { class: 'btn-link', type: 'button', onclick: logout }, 'Abmelden')))),
     h('section', { class: 'panel' },
       inviteCode ? [join, h('div', { class: 'divider' }, 'oder'), create]
-        : [create, h('div', { class: 'divider' }, 'oder einem Raum beitreten'), join])));
+        : [create, h('div', { class: 'divider' }, 'oder einem Raum beitreten'), join]),
+    renderLeaderboardPanel()));
 }
 
 function renderReplaced() {
@@ -483,44 +528,71 @@ function renderReplaced() {
       h('button', { class: 'btn btn-primary btn-wide', onclick: connect }, 'Stattdessen hier weiterspielen'))));
 }
 
+async function logout() {
+  await post('/api/logout').catch(() => {});
+  saveAccountToken(null);
+  account = null;
+  authMode = 'login';
+  resetToHome();
+}
+
 // --- Profil -------------------------------------------------------------------
 
-function openProfile() {
+async function refreshAccount() {
+  try {
+    ({ account } = await request('GET', '/api/me'));
+  } catch { /* Dann bleiben die zuletzt bekannten Zahlen stehen. */ }
+}
+
+async function openProfile() {
   profileOpen = true;
-  profileDraft = { name: profile.name, avatar: { ...profile.avatar } };
+  profileDraft = { avatar: { ...account.avatar } };
   renderProfile();
+  await refreshAccount();
+  if (profileOpen) renderProfile();
 }
 
 function closeProfile() {
   profileOpen = false;
   profileDraft = null;
   if (view) render();
-  else renderHome();
+  else {
+    renderHome();
+    loadLeaderboard();
+  }
 }
 
 function percent(part, whole) {
   return whole > 0 ? `${Math.round((part / whole) * 100)} %` : '–';
 }
 
-async function saveProfileDraft() {
-  const name = profileDraft.name.trim();
-  if (!name) {
-    fail('Bitte gib einen Namen ein.');
-    document.getElementById('profile-name')?.focus();
-    return;
+async function saveAvatar() {
+  try {
+    ({ account } = await post('/api/avatar', { avatar: profileDraft.avatar }));
+    Sound.play('points');
+    toast('Charakter gespeichert.');
+    closeProfile();
+  } catch (error) {
+    fail(error.message);
   }
-  // In einer Lobby muss der Raum den neuen Namen erst bestätigen, er könnte schon vergeben sein.
-  if (view && !(await act('profile', { name, avatar: profileDraft.avatar }))) return;
-  profile.name = name;
-  profile.avatar = profileDraft.avatar;
-  saveProfile();
-  Sound.play('points');
-  closeProfile();
+}
+
+async function changePassword(event) {
+  event.preventDefault();
+  const oldPassword = document.getElementById('old-password').value;
+  const newPassword = document.getElementById('new-password').value;
+  try {
+    const { token } = await post('/api/password', { oldPassword, newPassword });
+    saveAccountToken(token);
+    toast('Passwort geändert. Andere Geräte sind jetzt abgemeldet.');
+    event.target.reset();
+  } catch (error) {
+    fail(error.message);
+  }
 }
 
 function renderProfile() {
-  const isSetup = !profile.name;
-  document.title = isSetup ? 'Willkommen · Imposter' : 'Profil · Imposter';
+  document.title = 'Profil · Imposter';
   const { avatar } = profileDraft;
 
   const pick = (key, index) => {
@@ -553,36 +625,23 @@ function renderProfile() {
       h('div', { class: 'options' }, options));
   };
 
-  const { stats } = profile;
+  const { stats } = account;
   const stat = (label, value) => h('div', { class: 'stat' }, h('dt', {}, label), h('dd', {}, String(value)));
 
   mount('profile', h('div', { class: 'screen' },
-    isSetup
-      ? h('section', { class: 'hero' },
-          wordmark(),
-          h('p', { class: 'tagline' }, 'Wähl einen Namen und bau dir deinen Charakter, dann kann es losgehen.'))
-      : topbar('Profil'),
+    topbar(account.username),
     h('form', {
       class: 'panel',
       onsubmit: (event) => {
         event.preventDefault();
-        saveProfileDraft();
+        saveAvatar();
       },
     },
-      h('div', { class: 'field' },
-        h('label', { for: 'profile-name' }, 'Dein Name'),
-        h('input', {
-          id: 'profile-name',
-          key: 'profile-name',
-          maxlength: 16,
-          autocomplete: 'nickname',
-          value: profileDraft.name,
-          oninput: (event) => { profileDraft.name = event.target.value; },
-        })),
+      h('h2', { class: 'panel-title' }, 'Dein Charakter'),
       h('div', { class: 'avatar-preview' }, avatarNode(avatar, 'lg')),
       Object.keys(PARTS).map(partPicker),
-      h('button', { class: 'btn btn-primary btn-wide', type: 'submit', key: 'save' }, isSetup ? 'Los geht’s' : 'Speichern')),
-    !isSetup && h('section', { class: 'panel' },
+      h('button', { class: 'btn btn-primary btn-wide', type: 'submit', key: 'save' }, 'Speichern')),
+    h('section', { class: 'panel' },
       h('h2', { class: 'panel-title' }, 'Deine Stats'),
       h('dl', { class: 'stats' },
         stat('Punkte', stats.points),
@@ -590,9 +649,19 @@ function renderProfile() {
         stat('Spiele gespielt', stats.matchesPlayed),
         stat('Runden gespielt', stats.roundsPlayed),
         stat('Imposter-Siege', `${stats.imposterWins} von ${stats.imposterRounds}`),
-        stat('Richtige Stimmen', percent(stats.correctVotes, stats.votesCast))),
-      h('p', { class: 'hint' }, 'Name, Charakter und Stats sind in diesem Browser gespeichert.')),
-    !isSetup && h('button', { class: 'btn-link', type: 'button', onclick: closeProfile }, 'Zurück')));
+        stat('Richtige Stimmen', percent(stats.correctVotes, stats.votesCast)))),
+    h('form', { class: 'panel', onsubmit: changePassword },
+      h('h2', { class: 'panel-title' }, 'Passwort ändern'),
+      h('div', { class: 'field' },
+        h('label', { for: 'old-password' }, 'Altes Passwort'),
+        h('input', { id: 'old-password', type: 'password', autocomplete: 'current-password', required: true })),
+      h('div', { class: 'field' },
+        h('label', { for: 'new-password' }, 'Neues Passwort'),
+        h('input', { id: 'new-password', type: 'password', autocomplete: 'new-password', required: true, minlength: 6 })),
+      h('button', { class: 'btn btn-wide', type: 'submit' }, 'Passwort ändern')),
+    h('div', { class: 'link-row' },
+      h('button', { class: 'btn-link', type: 'button', onclick: closeProfile }, 'Zurück'),
+      !view && h('button', { class: 'btn-link', type: 'button', onclick: logout }, 'Abmelden'))));
 }
 
 // --- Lobby ------------------------------------------------------------------
@@ -616,7 +685,9 @@ function settingSelect(id, label, key, options) {
     h('label', { for: id }, label),
     h('select', {
       id, key: id,
-      onchange: (event) => act('settings', { [key]: key === 'category' ? event.target.value : Number(event.target.value) }),
+      onchange: (event) => act('settings', {
+        [key]: key === 'category' || key === 'mode' ? event.target.value : Number(event.target.value),
+      }),
     }, options));
 }
 
@@ -632,29 +703,52 @@ function renderLobby() {
   const numberOptions = (count, selected) => Array.from({ length: count }, (_, i) => i + 1)
     .map((n) => h('option', { value: n, selected: selected === n }, String(n)));
 
+  const undercover = view.settings.mode === 'undercover';
+  const timerLabel = (seconds) => (seconds === 0 ? 'Ohne Timer' : `${seconds} Sekunden`);
+
   const settings = isHost
-    ? h('div', { class: 'settings' },
-        settingSelect('rounds', 'Runden', 'rounds', numberOptions(view.maxRounds, view.settings.rounds)),
-        settingSelect('imposters', 'Imposter', 'imposters', numberOptions(view.maxImposters, imposters)),
-        settingSelect('category', 'Kategorie', 'category', [
-          h('option', { value: 'alle', selected: view.settings.category === 'alle' }, 'Alle gemischt'),
-          ...view.categories.map((c) => h('option', { value: c.id, selected: view.settings.category === c.id }, c.label)),
-        ]))
+    ? [
+        h('div', { class: 'settings' },
+          settingSelect('rounds', 'Runden', 'rounds', numberOptions(view.maxRounds, view.settings.rounds)),
+          settingSelect('imposters', 'Imposter', 'imposters', numberOptions(view.maxImposters, imposters)),
+          settingSelect('category', 'Kategorie', 'category', [
+            h('option', { value: 'alle', selected: view.settings.category === 'alle' }, 'Alle gemischt'),
+            ...view.categories.map((c) => h('option', { value: c.id, selected: view.settings.category === c.id }, c.label)),
+          ])),
+        h('div', { class: 'settings settings-two' },
+          settingSelect('mode', 'Modus', 'mode', [
+            h('option', { value: 'classic', selected: !undercover }, 'Klassisch'),
+            h('option', { value: 'undercover', selected: undercover }, 'Undercover'),
+          ]),
+          settingSelect('turnSeconds', 'Zeit pro Wort', 'turnSeconds', view.timerOptions.map((seconds) =>
+            h('option', { value: seconds, selected: view.settings.turnSeconds === seconds }, timerLabel(seconds))))),
+      ]
     : h('p', { class: 'settings-readout' },
-        'Runden: ', h('b', {}, String(view.settings.rounds)),
+        'Modus: ', h('b', {}, undercover ? 'Undercover' : 'Klassisch'),
+        ' · Runden: ', h('b', {}, String(view.settings.rounds)),
         ' · Imposter: ', h('b', {}, String(imposters)),
         ' · Kategorie: ', h('b', {}, categoryLabel),
-        imposters > 1 && [' · Imposter sehen sich: ', h('b', {}, view.settings.impostersKnow ? 'Ja' : 'Nein')]);
+        ' · Zeit: ', h('b', {}, timerLabel(view.settings.turnSeconds)),
+        !undercover && view.settings.imposterHint && [' · ', h('b', {}, 'Imposter sieht die Kategorie')],
+        !undercover && imposters > 1 && [' · Imposter sehen sich: ', h('b', {}, view.settings.impostersKnow ? 'Ja' : 'Nein')]);
 
-  // Mit nur einem Imposter gibt es niemanden, den er sehen könnte.
-  const knowSetting = isHost && imposters > 1 && h('label', { class: 'toggle-row' },
+  const checkbox = (key, label) => h('label', { class: 'toggle-row' },
     h('input', {
       type: 'checkbox',
-      key: 'imposters-know',
-      checked: view.settings.impostersKnow,
-      onchange: (event) => act('settings', { impostersKnow: event.target.checked }),
+      key,
+      checked: view.settings[key],
+      onchange: (event) => act('settings', { [key]: event.target.checked }),
     }),
-    'Imposter sehen sich gegenseitig');
+    label);
+
+  // Im Undercover-Modus wissen die Imposter nichts von ihrer Rolle, beide Häkchen ergeben dort keinen Sinn.
+  // Mit nur einem Imposter gibt es niemanden, den er sehen könnte.
+  const knowSetting = isHost && !undercover && [
+    checkbox('imposterHint', 'Imposter sieht die Kategorie des Wortes'),
+    imposters > 1 && checkbox('impostersKnow', 'Imposter sehen sich gegenseitig'),
+  ];
+  const modeHint = undercover && h('p', { class: 'hint' },
+    'Undercover: Die Imposter bekommen ein ähnliches Wort und wissen selbst nicht, dass sie Imposter sind.');
 
   mount('lobby', h('div', { class: 'screen' },
     topbar(`${present.length} Spieler`),
@@ -676,6 +770,7 @@ function renderLobby() {
             p.id === view.hostId && h('span', { class: 'tag tag-host' }, 'Host'))))),
       settings,
       knowSetting,
+      modeHint,
       isHost && view.maxImposters === 1 && h('p', { class: 'hint' }, 'Ab 3 Spielern kannst du mehr als einen Imposter einstellen.'),
       h('p', { class: 'hint' }, 'Richtig abgestimmt: 10 Punkte. Imposter gewinnt: 25 Punkte.')),
     h('div', { class: 'actions' },
@@ -995,9 +1090,14 @@ function renderCard(round) {
       h('span', { class: `card-face card-front${isImposter ? ' is-imposter' : ''}` },
         h('span', { class: 'card-front-label' }, isImposter ? 'Pssst …' : 'Dein Wort'),
         h('span', { class: 'card-word', lang: 'de' }, isImposter ? 'Du bist Imposter' : round.card.word),
-        h('span', { class: 'card-front-hint' }, isImposter && round.partners?.length
-          ? `Mit dir im Team: ${round.partners.map(nameOf).join(', ')}`
-          : (isImposter ? 'Hör gut zu und tu so, als wüsstest du das Wort' : 'Tippen zum Verdecken')))));
+        isImposter && round.card.hint && h('span', { class: 'card-front-category' }, `Kategorie: ${round.card.hint}`),
+        h('span', { class: 'card-front-hint' }, imposterCardHint(round, isImposter)))));
+}
+
+function imposterCardHint(round, isImposter) {
+  if (!isImposter) return 'Tippen zum Verdecken';
+  if (round.partners?.length) return `Mit dir im Team: ${round.partners.map(nameOf).join(', ')}`;
+  return 'Hör gut zu und tu so, als wüsstest du das Wort';
 }
 
 function renderWordForm(round) {
@@ -1033,7 +1133,8 @@ function imposterCountNote(round) {
   const count = round.imposterCount;
   return h('p', { class: 'imposter-count' },
     h('strong', {}, String(count)),
-    ' Imposter in dieser Runde');
+    ' Imposter in dieser Runde',
+    round.undercover && ' · Undercover: Sie haben ein ähnliches Wort');
 }
 
 function renderPlay() {
@@ -1061,7 +1162,7 @@ function renderPlay() {
         h('div', { class: 'speaker-name' }, isYourTurn
           ? (round.isFirstTurn ? 'Du fängst an!' : 'Du bist dran!')
           : (round.isFirstTurn ? `${current} fängt an` : `${current} ist dran`))),
-      h('div', { class: 'turn-timer', 'aria-hidden': 'true' },
+      round.turnLength > 0 && h('div', { class: 'turn-timer', 'aria-hidden': 'true' },
         h('span', { class: 'turn-seconds' }),
         h('div', { class: 'turn-bar' }, h('span', { class: 'turn-bar-fill' })))),
     isYourTurn && h('section', { class: 'panel' }, renderWordForm(round)),
@@ -1185,6 +1286,9 @@ function renderReveal() {
       h('div', { class: 'fact' },
         h('div', { class: 'panel-title' }, 'Das Wort'),
         h('div', { class: 'fact-value' }, reveal.word)),
+      reveal.undercoverWord && h('div', { class: 'fact' },
+        h('div', { class: 'panel-title' }, 'Wort der Imposter'),
+        h('div', { class: 'fact-value' }, reveal.undercoverWord)),
       h('div', { class: 'fact' },
         h('div', { class: 'panel-title' }, plural ? 'Die Imposter' : 'Imposter'),
         h('div', { class: 'fact-value' }, imposterNames))),
@@ -1234,8 +1338,20 @@ function renderFinal() {
     topbar(`Endergebnis nach ${total} ${total === 1 ? 'Runde' : 'Runden'}`),
     h('section', { class: `verdict${youWon ? ' group-won' : ''}` },
       h('h1', { class: 'verdict-title' }, title),
-      h('p', {}, 'Deine Stats sind gespeichert.')),
+      h('p', {}, 'Die Stats sind in euren Konten gespeichert.')),
     h('ol', { class: 'podium panel' }, rows),
+    view.match.titles.length > 0 && h('section', { class: 'panel' },
+      h('h2', { class: 'panel-title' }, 'Titel des Abends'),
+      h('ul', { class: 'titles' }, view.match.titles.map((entry) =>
+        h('li', { class: `title-row${entry.playerIds.includes(view.you.id) ? ' is-you' : ''}` },
+          h('div', { class: 'title-avatars' }, entry.playerIds.map((id) => {
+            const player = playerOf(id);
+            return player ? avatarNode(player.avatar) : null;
+          })),
+          h('div', { class: 'title-main' },
+            h('div', { class: 'title-name' }, entry.title),
+            h('div', { class: 'title-who' }, entry.playerIds.map(nameOf).join(', ')),
+            h('div', { class: 'hint' }, `${entry.text} (${entry.value}×)`)))))),
     view.you.isHost
       ? h('div', { class: 'actions-row' },
           h('button', { class: 'btn btn-primary', key: 'rematch', onclick: () => act('start') }, 'Nochmal spielen'),
@@ -1275,6 +1391,25 @@ document.addEventListener('click', (event) => {
   if (button && !button.disabled && !button.dataset.silent) Sound.play('click');
 });
 
-updateSoundToggle();
-if (session?.code && session?.token && profile.name) connect();
-else renderHome();
+async function start() {
+  updateSoundToggle();
+  if (!accountToken) {
+    renderAuth();
+    return;
+  }
+  try {
+    ({ account } = await request('GET', '/api/me'));
+  } catch (error) {
+    if (error.status === 401) saveAccountToken(null);
+    else landingMessage = 'Der Server antwortet gerade nicht. Lade die Seite gleich noch mal.';
+    renderAuth();
+    return;
+  }
+  if (session?.code && session?.token) connect();
+  else {
+    renderHome();
+    loadLeaderboard();
+  }
+}
+
+start();

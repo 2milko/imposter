@@ -1,8 +1,7 @@
 'use strict';
 
-const { randomInt, randomBytes, createHash } = require('node:crypto');
+const { randomInt, randomBytes } = require('node:crypto');
 const { GameError } = require('./errors');
-const { isValidAvatar } = require('./public/avatar');
 const WORDS = require('./words');
 
 const MIN_PLAYERS = 3;
@@ -15,17 +14,20 @@ const POINTS_IMPOSTER_WIN = 25;
 const HOST_GRACE_MS = 20_000;
 const LOBBY_GRACE_MS = 60_000;
 const ROOM_IDLE_MS = 30 * 60_000;
-const MAX_NAME_LENGTH = 16;
 const MAX_GUESS_LENGTH = 40;
 const TURN_MS = 30_000;
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // ohne I und O (Verwechslungsgefahr)
+const TIMER_OPTIONS = [0, 15, 30, 45, 60, 90]; // Sekunden pro Wort, 0 heißt ohne Timer
+const MODES = ['classic', 'undercover'];
 
-function cleanName(raw) {
-  const name = String(raw ?? '').replace(/\s+/g, ' ').trim();
-  if (!name) throw new GameError('Bitte gib einen Namen ein.');
-  if (name.length > MAX_NAME_LENGTH) throw new GameError(`Der Name darf höchstens ${MAX_NAME_LENGTH} Zeichen haben.`);
-  return name;
-}
+// Titel am Spielende. Wer bei einem Wert vorne liegt, bekommt den Titel, bei Gleichstand alle.
+const TITLES = [
+  { key: 'imposterWins', title: 'Meister-Bluffer', text: 'Als Imposter am häufigsten gewonnen' },
+  { key: 'correctVotes', title: 'Detektiv', text: 'Die meisten Imposter richtig erkannt' },
+  { key: 'correctGuesses', title: 'Gedankenleser', text: 'Das geheime Wort erraten' },
+  { key: 'wrongVotes', title: 'Paranoid', text: 'Am häufigsten Unschuldige angeklagt' },
+  { key: 'suspicion', title: 'Hauptverdächtig', text: 'Die meisten Stimmen und Sus-Markierungen bekommen' },
+];
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // ohne I und O (Verwechslungsgefahr)
 
 function normalizeWord(text) {
   return String(text).toLowerCase()
@@ -58,23 +60,8 @@ function isSameWord(guess, word) {
   return editDistance(a, b) <= allowedTypos;
 }
 
-function requireValidAvatar(avatar) {
-  if (!isValidAvatar(avatar)) throw new GameError('Ungültiger Avatar.');
-  return avatar;
-}
-
-// Es gibt kein Login: Der Browser merkt sich eine geheime, zufällige Kennung. Mitspieler
-// sehen nur ihren Hash, können sich also nicht als jemand anderes ausgeben.
-function identify({ clientId, name, avatar }) {
-  if (typeof clientId !== 'string' || clientId.length < 16 || clientId.length > 100) {
-    throw new GameError('Ungültige Anfrage.');
-  }
-  return {
-    id: createHash('sha256').update(clientId).digest('hex').slice(0, 16),
-    username: cleanName(name),
-    avatar: requireValidAvatar(avatar),
-  };
-}
+// Der Server hängt hier die Speicherung der Stats in der Datenbank ein.
+const events = { onRound: null, onMatch: null };
 
 function shuffle(list) {
   const result = [...list];
@@ -107,7 +94,15 @@ class Room {
     this.players = new Map();
     this.hostId = null;
     this.phase = 'lobby'; // lobby | play | vote | reveal | final
-    this.settings = { category: 'alle', imposters: 1, rounds: 3, impostersKnow: false };
+    this.settings = {
+      category: 'alle',
+      imposters: 1,
+      rounds: 3,
+      impostersKnow: false,
+      turnSeconds: TURN_MS / 1000,
+      mode: 'classic',
+      imposterHint: false,
+    };
     this.match = null;
     this.round = null;
     this.result = null;
@@ -119,15 +114,8 @@ class Room {
 
   // --- Spieler ---------------------------------------------------------
 
-  requireFreeName(name, ownId) {
-    const taken = [...this.players.values()].some(
-      (p) => p.id !== ownId && !p.left && p.name.toLowerCase() === name.toLowerCase(),
-    );
-    if (taken) throw new GameError('Dieser Name ist in dem Raum schon vergeben.', 409);
-  }
-
+  // Namen sind über die Konten ohnehin eindeutig.
   addPlayer(account) {
-    this.requireFreeName(account.username, account.id);
     const existing = this.players.get(account.id);
     if (existing) {
       // Wer die Verbindung verloren oder den Tab geschlossen hat, kommt auf seinen Platz zurück.
@@ -155,12 +143,11 @@ class Room {
     return player;
   }
 
-  updateProfile(player, { name, avatar }) {
-    this.requirePhase('lobby');
-    const cleaned = cleanName(name);
-    this.requireFreeName(cleaned, player.id);
-    player.avatar = requireValidAvatar(avatar);
-    player.name = cleaned;
+  updateAvatar(accountId, avatar) {
+    const player = this.players.get(accountId);
+    if (!player) return;
+    player.avatar = avatar;
+    this.broadcast();
   }
 
   findByToken(token) {
@@ -276,7 +263,7 @@ class Room {
     if (!phases.includes(this.phase)) throw new GameError('Das geht gerade nicht.', 409);
   }
 
-  updateSettings(player, { category, imposters, rounds, impostersKnow }) {
+  updateSettings(player, { category, imposters, rounds, impostersKnow, turnSeconds, mode, imposterHint }) {
     this.requireHost(player);
     this.requirePhase('lobby');
     if (category !== undefined) {
@@ -298,20 +285,55 @@ class Room {
       this.settings.rounds = count;
     }
     if (impostersKnow !== undefined) this.settings.impostersKnow = impostersKnow === true;
+    if (imposterHint !== undefined) this.settings.imposterHint = imposterHint === true;
+    if (turnSeconds !== undefined) {
+      const seconds = Number(turnSeconds);
+      if (!TIMER_OPTIONS.includes(seconds)) throw new GameError('Ungültige Zeit pro Wort.');
+      this.settings.turnSeconds = seconds;
+    }
+    if (mode !== undefined) {
+      if (!MODES.includes(mode)) throw new GameError('Unbekannter Spielmodus.');
+      this.settings.mode = mode;
+    }
   }
 
-  pickWord() {
-    const { category } = this.settings;
-    const entries = category === 'alle' ? Object.values(WORDS) : [WORDS[category]];
-    const pool = entries.flatMap((entry) => entry.words);
-    let available = pool.filter((word) => !this.usedWords.has(word));
+  // Liefert das Wort der Runde. Im Undercover-Modus zusätzlich ein ähnliches Wort für die Imposter.
+  pickWords() {
+    const { category, mode } = this.settings;
+    const ids = category === 'alle' ? Object.keys(WORDS) : [category];
+    const undercover = mode === 'undercover';
+
+    // Jeder Eintrag ist entweder ein festes Paar oder ein einzelnes Wort aus der Kategorie.
+    const pool = ids.flatMap((id) => {
+      const entry = WORDS[id];
+      if (undercover && entry.pairs) {
+        return entry.pairs.map((pair) => ({ id, key: pair.join('|'), pair }));
+      }
+      return entry.words.map((word) => ({ id, key: word, word }));
+    });
+    let available = pool.filter((item) => !this.usedWords.has(item.key));
     if (available.length === 0) {
-      for (const word of pool) this.usedWords.delete(word);
+      for (const item of pool) this.usedWords.delete(item.key);
       available = pool;
     }
-    const word = available[randomInt(available.length)];
-    this.usedWords.add(word);
-    return word;
+    const picked = available[randomInt(available.length)];
+    this.usedWords.add(picked.key);
+    const categoryLabel = WORDS[picked.id].label;
+
+    if (!undercover) return { word: picked.word, undercoverWord: null, categoryLabel };
+    if (picked.pair) {
+      const [a, b] = shuffle(picked.pair);
+      return { word: a, undercoverWord: b, categoryLabel };
+    }
+    const others = WORDS[picked.id].words.filter((word) => word !== picked.word);
+    return { word: picked.word, undercoverWord: others[randomInt(others.length)], categoryLabel };
+  }
+
+  award(id, key, amount = 1) {
+    const awards = this.match.awards;
+    const entry = awards.get(id) ?? Object.fromEntries(TITLES.map((t) => [t.key, 0]));
+    entry[key] += amount;
+    awards.set(id, entry);
   }
 
   purgeLeftPlayers() {
@@ -339,6 +361,8 @@ class Room {
       scores: new Map(),
       participants: new Set(),
       winners: [],
+      awards: new Map(),
+      titles: [],
     };
     this.beginRound(participants);
   }
@@ -363,9 +387,14 @@ class Room {
 
     this.match.current++;
     for (const id of ids) this.match.participants.add(id);
+    const { word, undercoverWord, categoryLabel } = this.pickWords();
     this.round = {
       id: ++this.roundCounter,
-      word: this.pickWord(),
+      word,
+      undercoverWord,          // Nur im Undercover-Modus: das Wort der Imposter
+      hint: this.settings.imposterHint && !undercoverWord ? categoryLabel : null,
+      impostersKnow: this.settings.impostersKnow && !undercoverWord,
+      turnMs: this.settings.turnSeconds * 1000,
       imposters: new Set(shuffle(ids).slice(0, imposterCount)),
       order: shuffle(ids), // Der Erste in dieser Liste fängt an.
       position: 0,
@@ -426,8 +455,13 @@ class Room {
 
   startTurnTimer() {
     this.stopTurnTimer();
-    this.turnEndsAt = Date.now() + TURN_MS;
-    this.turnTimer = setTimeout(() => this.handleTurnTimeout(), TURN_MS);
+    const ms = this.round.turnMs;
+    if (!ms) {
+      this.turnEndsAt = null; // Ohne Timer gibt der Sprecher selbst weiter.
+      return;
+    }
+    this.turnEndsAt = Date.now() + ms;
+    this.turnTimer = setTimeout(() => this.handleTurnTimeout(), ms);
     this.turnTimer.unref?.();
   }
 
@@ -504,6 +538,7 @@ class Room {
   submitGuess(player, rawGuess) {
     this.requirePhase('play', 'vote');
     const round = this.round;
+    if (round.undercoverWord) throw new GameError('Im Undercover-Modus gibt es kein Raten.', 409);
     if (!round.imposters.has(player.id)) throw new GameError('Nur Imposter können das Wort raten.', 403);
     if (round.kicked.has(player.id)) throw new GameError('Du wurdest rausgewählt und kannst nicht mehr raten.', 403);
     const text = String(rawGuess ?? '').replace(/\s+/g, ' ').trim();
@@ -594,7 +629,13 @@ class Room {
       .sort((a, b) => b.count - a.count);
     for (const [voter, target] of round.votes) {
       round.votesCast.set(voter, (round.votesCast.get(voter) ?? 0) + 1);
-      if (round.imposters.has(target)) round.correctVotes.set(voter, (round.correctVotes.get(voter) ?? 0) + 1);
+      this.award(target, 'suspicion');
+      if (round.imposters.has(target)) {
+        round.correctVotes.set(voter, (round.correctVotes.get(voter) ?? 0) + 1);
+        this.award(voter, 'correctVotes');
+      } else {
+        this.award(voter, 'wrongVotes');
+      }
     }
     round.votes.clear();
 
@@ -635,7 +676,13 @@ class Room {
     });
     for (const entry of entries) {
       this.match.scores.set(entry.id, (this.match.scores.get(entry.id) ?? 0) + entry.points);
+      if (entry.imposterWon) this.award(entry.id, 'imposterWins');
     }
+    for (const [id, markers] of round.sus) {
+      if (markers.size > 0) this.award(id, 'suspicion', markers.size);
+    }
+    if (guess?.correct) this.award(guess.playerId, 'correctGuesses');
+    events.onRound?.(entries);
 
     this.result = {
       accusedId,
@@ -657,6 +704,14 @@ class Room {
     });
     const top = Math.max(0, ...contenders.map((id) => match.scores.get(id) ?? 0));
     match.winners = top > 0 ? contenders.filter((id) => (match.scores.get(id) ?? 0) === top) : [];
+
+    const valueOf = (id, key) => match.awards.get(id)?.[key] ?? 0;
+    match.titles = TITLES.flatMap(({ key, title, text }) => {
+      const best = Math.max(0, ...contenders.map((id) => valueOf(id, key)));
+      if (best === 0) return [];
+      return [{ title, text, value: best, playerIds: contenders.filter((id) => valueOf(id, key) === best) }];
+    });
+    events.onMatch?.([...match.participants], match.winners);
   }
 
   backToLobby(notice = null) {
@@ -678,7 +733,6 @@ class Room {
   handleAction(player, { type, ...payload }) {
     switch (type) {
       case 'settings': this.updateSettings(player, payload); break;
-      case 'profile': this.updateProfile(player, payload); break;
       case 'start': this.startMatch(player); break;
       case 'nextRound': this.nextRound(player); break;
       case 'showFinal': this.showFinal(player); break;
@@ -731,7 +785,13 @@ class Room {
         points: match.scores.get(p.id) ?? 0,
       }))
       .sort((a, b) => b.points - a.points || a.name.localeCompare(b.name, 'de'));
-    return { current: match.current, total: match.total, leaderboard, winners: match.winners };
+    return {
+      current: match.current,
+      total: match.total,
+      leaderboard,
+      winners: match.winners,
+      titles: match.titles,
+    };
   }
 
   // Jeder Spieler bekommt nur, was er wissen darf: Vor der Auflösung erfährt
@@ -755,6 +815,7 @@ class Room {
       categories: Object.entries(WORDS).map(([id, entry]) => ({ id, label: entry.label })),
       maxImposters: maxImposters(online),
       maxRounds: MAX_ROUNDS,
+      timerOptions: TIMER_OPTIONS,
       maxWordLength: MAX_WORD_LENGTH,
       minPlayers: MIN_PLAYERS,
       onlineCount: online,
@@ -773,10 +834,9 @@ class Room {
       inRound,
       words: round.words,
       sus: [...round.sus].map(([id, markers]) => ({ id, by: [...markers] })).filter((entry) => entry.by.length > 0),
-      card: !inRound ? null
-        : round.imposters.has(player.id) ? { type: 'imposter' }
-        : { type: 'word', word: round.word },
+      card: this.cardFor(player),
       imposterCount: round.imposters.size,
+      undercover: Boolean(round.undercoverWord),
       youKicked: round.kicked.has(player.id),
       // Die Rolle sieht man nur, wenn sie gezeigt wurde oder die Runde vorbei ist.
       kicked: [...round.kicked].map(([id, state]) => ({
@@ -784,7 +844,7 @@ class Room {
         role: state.shown || this.phase === 'reveal' ? (round.imposters.has(id) ? 'imposter' : 'word') : null,
       })),
     };
-    if (this.settings.impostersKnow && round.imposters.has(player.id)) {
+    if (round.impostersKnow && round.imposters.has(player.id)) {
       view.round.partners = [...round.imposters].filter((id) => id !== player.id);
     }
     if (this.phase === 'kicked') view.round.kick = round.kick;
@@ -794,8 +854,8 @@ class Room {
       view.round.lap = round.lap;
       view.round.turn = round.turn;
       view.round.isFirstTurn = round.turn === 0;
-      view.round.turnEndsIn = Math.max(0, this.turnEndsAt - Date.now());
-      view.round.turnLength = TURN_MS;
+      view.round.turnEndsIn = this.turnEndsAt === null ? null : Math.max(0, this.turnEndsAt - Date.now());
+      view.round.turnLength = round.turnMs;
     }
     if (this.phase === 'guess') {
       const judges = this.guessJudges();
@@ -818,11 +878,21 @@ class Room {
     if (this.phase === 'reveal') {
       view.round.reveal = {
         word: round.word,
+        undercoverWord: round.undercoverWord,
         imposterIds: [...round.imposters],
         ...this.result,
       };
     }
     return view;
+  }
+
+  // Im Undercover-Modus sieht der Imposter ein normales Wort und weiß nicht, dass er Imposter ist.
+  cardFor(player) {
+    const round = this.round;
+    if (!round.order.includes(player.id)) return null;
+    if (!round.imposters.has(player.id)) return { type: 'word', word: round.word };
+    if (round.undercoverWord) return { type: 'word', word: round.undercoverWord };
+    return round.hint ? { type: 'imposter', hint: round.hint } : { type: 'imposter' };
   }
 
   broadcast() {
@@ -847,6 +917,10 @@ function getRoom(code) {
   return room;
 }
 
+function updateAvatarInRooms(accountId, avatar) {
+  for (const room of rooms.values()) room.updateAvatar(accountId, avatar);
+}
+
 function sweepRooms(now = Date.now()) {
   for (const [code, room] of rooms) {
     const anyoneOnline = [...room.players.values()].some((p) => p.conn);
@@ -861,10 +935,12 @@ module.exports = {
   GameError,
   isSameWord,
   TURN_MS,
-  identify,
+  TITLES,
+  events,
   createRoom,
   getRoom,
   sweepRooms,
+  updateAvatarInRooms,
   maxImposters,
   rooms,
   POINTS_CORRECT_VOTE,

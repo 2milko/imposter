@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createRoom, identify, maxImposters, isSameWord, TURN_MS } = require('../game');
+const { createRoom, maxImposters, isSameWord, TURN_MS, events, updateAvatarInRooms } = require('../game');
 const { randomAvatar, isValidAvatar, avatarMarkup, PARTS } = require('../public/avatar');
 
 let nextId = 1;
@@ -54,10 +54,10 @@ test('vor der Auflösung verrät die Sicht von niemandem zu viel', () => {
   room.handleAction(host, { type: 'start' });
   const { imposters, others } = roles(room, players);
 
-  assert.ok(!JSON.stringify(room.viewFor(imposters[0])).includes(`"${room.round.word}"`));
+  assert.ok(!JSON.stringify(room.viewFor(imposters[0]).round).includes(`"${room.round.word}"`));
 
   room.handleAction(host, { type: 'startVote' });
-  assert.ok(!JSON.stringify(room.viewFor(imposters[0])).includes(`"${room.round.word}"`));
+  assert.ok(!JSON.stringify(room.viewFor(imposters[0]).round).includes(`"${room.round.word}"`));
   for (const p of others) {
     assert.equal(room.viewFor(p).round.reveal, undefined);
     assert.ok(!JSON.stringify(room.viewFor(p)).includes('imposterIds'));
@@ -181,7 +181,8 @@ test('Rauswahl: Eine Person fliegt raus, die Runde geht ohne sie weiter', () => 
   room.handleAction(host, { type: 'continueRound' });
   assert.equal(room.phase, 'play');
   assert.equal(room.round.lap, lapBefore + 1);
-  assert.equal(room.viewFor(host).round.turnEndsIn, TURN_MS);
+  // Echte Uhr: Zwischen Weiterspielen und Abfrage kann eine Millisekunde vergehen.
+  assert.ok(TURN_MS - room.viewFor(host).round.turnEndsIn < 1000, 'der Timer startet neu');
   const speakers = new Set();
   for (let i = 0; i < 8; i++) {
     speakers.add(room.round.order[room.round.position]);
@@ -287,7 +288,10 @@ test('Spielende: Sind die Imposter in der Überzahl, gewinnen auch die rausgewä
   second.room.handleAction(second.host, { type: 'startVote' });
   voteOut(second.room, second.players, parts.others[2]);
   assert.equal(second.room.phase, 'reveal', '1 Imposter gegen 1 Wort-Kenner');
-  assert.equal(second.room.match.scores.get(parts.imposters[0].id), 25, 'auch der rausgewählte Imposter gewinnt mit');
+  // Mindestens 25: Stimmt ein Imposter zufällig für seinen Partner, kommen 10 Punkte dazu.
+  const kickedGain = second.room.result.gains.find((g) => g.id === parts.imposters[0].id);
+  assert.equal(kickedGain.imposterWon, true, 'auch der rausgewählte Imposter gewinnt mit');
+  assert.ok(kickedGain.points >= 25);
 });
 
 test('Rausgewählte Imposter können nicht mehr raten, Stats zählen alle Stimmen', () => {
@@ -430,42 +434,39 @@ test('Die Auflösung liefert dem Browser alles für seine Stats', () => {
   });
 });
 
-test('Ohne Login: Die geheime Browser-Kennung bleibt geheim und muss gültig sein', () => {
-  const clientId = 'a'.repeat(32);
+test('Ein neuer Charakter erscheint sofort bei allen im Raum', () => {
+  const { room, host, players } = setup(3);
   const avatar = randomAvatar();
-  const person = identify({ clientId, name: '  Milko  ', avatar });
-  assert.equal(person.username, 'Milko');
-  assert.equal(identify({ clientId, name: 'Anders', avatar }).id, person.id, 'gleicher Browser, gleiche Person');
-  assert.ok(!person.id.includes(clientId) && !clientId.includes(person.id));
-
-  const { room, player: host } = createRoom(person);
-  room.attach(host, fakeConn());
-  assert.ok(!JSON.stringify(room.viewFor(host)).includes(clientId));
-
-  assert.throws(() => identify({ clientId: 'kurz', name: 'Milko', avatar }), /Ungültige Anfrage/);
-  assert.throws(() => identify({ clientId, name: '   ', avatar }), /Namen/);
-  assert.throws(() => identify({ clientId, name: 'x'.repeat(17), avatar }), /höchstens 16/);
-  assert.throws(() => identify({ clientId, name: 'Milko', avatar: { ...avatar, head: 99 } }), /Avatar/);
-});
-
-test('Namen sind pro Raum eindeutig, auch beim Umbenennen', () => {
-  const { room, players } = setup(3);
-  assert.throws(() => room.addPlayer(fakeAccount('spieler1')), /vergeben/);
-  assert.throws(() => room.handleAction(players[2], {
-    type: 'profile', name: 'SPIELER1', avatar: randomAvatar(),
-  }), /vergeben/);
-
-  const avatar = randomAvatar();
-  room.handleAction(players[2], { type: 'profile', name: 'Neu', avatar });
-  const seen = room.viewFor(players[0]).players.find((p) => p.id === players[2].id);
-  assert.equal(seen.name, 'Neu');
+  updateAvatarInRooms(players[2].id, avatar);
+  const seen = room.viewFor(host).players.find((p) => p.id === players[2].id);
   assert.deepEqual(seen.avatar, avatar);
 });
 
-test('Das Profil lässt sich während einer Runde nicht ändern', () => {
-  const { room, host } = setup(3);
-  room.handleAction(host, { type: 'start' });
-  assert.throws(() => room.handleAction(host, { type: 'profile', name: 'Neu', avatar: randomAvatar() }), /geht gerade nicht/);
+test('Stats-Ereignisse melden jede Runde und das Spielende', () => {
+  const rounds = [];
+  const matches = [];
+  events.onRound = (entries) => rounds.push(entries);
+  events.onMatch = (participants, winners) => matches.push({ participants, winners });
+  try {
+    const { room, host, players } = setup(3, 2);
+    room.handleAction(host, { type: 'start' });
+    const first = roles(room, players);
+    room.handleAction(host, { type: 'startVote' });
+    voteOut(room, players, first.imposters[0]);
+    assert.equal(rounds.length, 1);
+    assert.equal(matches.length, 0);
+
+    room.handleAction(host, { type: 'nextRound' });
+    const second = roles(room, players);
+    room.handleAction(second.imposters[0], { type: 'guess', guess: room.round.word });
+    assert.equal(rounds.length, 2);
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].participants.length, 3);
+    assert.ok(rounds[1].some((entry) => entry.imposterWon && entry.points === 25));
+  } finally {
+    events.onRound = null;
+    events.onMatch = null;
+  }
 });
 
 test('Timer: Nach 30 Sekunden kommt automatisch der Nächste dran, ein Wort startet die Zeit neu', (t) => {
@@ -538,7 +539,7 @@ test('Wort raten: Nur Imposter dürfen raten, und das Wort bleibt bis zur Auflö
   assert.equal(room.phase, 'guess');
   const seenByImposter = room.viewFor(imposters[0]);
   assert.equal(seenByImposter.round.guess.text, 'zzz-ganz-anders');
-  assert.ok(!JSON.stringify(seenByImposter).includes(`"${room.round.word}"`));
+  assert.ok(!JSON.stringify(seenByImposter.round).includes(`"${room.round.word}"`));
   assert.equal(room.viewFor(others[0]).round.guess.text, 'zzz-ganz-anders');
 });
 
@@ -632,6 +633,118 @@ test('Sus: Markierungen sehen alle, sie lassen sich zurücknehmen und gelten pro
   assert.deepEqual(room.viewFor(a).round.sus, []);
 });
 
+test('Timer: Zeit pro Wort einstellbar, auch ganz ohne Timer', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const fast = setup(3);
+  assert.throws(() => fast.room.handleAction(fast.host, { type: 'settings', turnSeconds: 7 }), /Ungültige Zeit/);
+  fast.room.handleAction(fast.host, { type: 'settings', turnSeconds: 15 });
+  fast.room.handleAction(fast.host, { type: 'start' });
+  const first = fast.room.round.order[0];
+  assert.equal(fast.room.viewFor(fast.host).round.turnLength, 15_000);
+  t.mock.timers.tick(15_000);
+  assert.notEqual(fast.room.round.order[fast.room.round.position], first);
+
+  const off = setup(3);
+  off.room.handleAction(off.host, { type: 'settings', turnSeconds: 0 });
+  off.room.handleAction(off.host, { type: 'start' });
+  const view = off.room.viewFor(off.host).round;
+  assert.equal(view.turnEndsIn, null);
+  assert.equal(view.turnLength, 0);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(off.room.round.position, 0, 'ohne Timer wartet das Spiel');
+  assert.equal(off.room.round.words.length, 0);
+});
+
+function undercoverRound(count = 5, imposters = 1) {
+  const game = setup(count);
+  game.room.handleAction(game.host, { type: 'settings', mode: 'undercover', imposters, impostersKnow: true, imposterHint: true });
+  game.room.handleAction(game.host, { type: 'start' });
+  return { ...game, ...roles(game.room, game.players) };
+}
+
+test('Undercover: Der Imposter bekommt ein ähnliches Wort und erfährt nichts von seiner Rolle', () => {
+  for (let i = 0; i < 30; i++) {
+    const { room, imposters, others } = undercoverRound(5, 2);
+    const { word, undercoverWord } = room.round;
+    assert.ok(undercoverWord, 'es gibt ein zweites Wort');
+    assert.notEqual(undercoverWord, word);
+    for (const imposter of imposters) {
+      const view = room.viewFor(imposter);
+      assert.deepEqual(view.round.card, { type: 'word', word: undercoverWord });
+      assert.equal(view.round.partners, undefined, 'auch mit Häkchen kein Team im Undercover-Modus');
+      // Nur die Rundendaten prüfen: Manche Wörter heißen wie eine Kategorie (Naruto, Fußball).
+      assert.ok(!JSON.stringify(view.round).includes(`"${word}"`));
+    }
+    for (const other of others) {
+      const view = room.viewFor(other);
+      assert.deepEqual(view.round.card, { type: 'word', word });
+      assert.ok(!JSON.stringify(view.round).includes(`"${undercoverWord}"`));
+    }
+  }
+});
+
+test('Undercover: Kein Raten, die Auflösung zeigt beide Wörter', () => {
+  const { room, host, players, imposters } = undercoverRound(3);
+  assert.throws(() => room.handleAction(imposters[0], { type: 'guess', guess: room.round.word }), /kein Raten/);
+  room.handleAction(host, { type: 'startVote' });
+  voteOut(room, players, imposters[0]);
+  const { reveal } = room.viewFor(host).round;
+  assert.equal(reveal.word, room.round.word);
+  assert.equal(reveal.undercoverWord, room.round.undercoverWord);
+  assert.equal(reveal.caught, true);
+});
+
+test('Hinweis: Der Imposter sieht die Kategorie nur, wenn der Host es einschaltet', () => {
+  const off = setup(3);
+  off.room.handleAction(off.host, { type: 'settings', category: 'naruto' });
+  off.room.handleAction(off.host, { type: 'start' });
+  const offRoles = roles(off.room, off.players);
+  assert.deepEqual(off.room.viewFor(offRoles.imposters[0]).round.card, { type: 'imposter' });
+
+  const on = setup(3);
+  on.room.handleAction(on.host, { type: 'settings', category: 'naruto', imposterHint: true });
+  on.room.handleAction(on.host, { type: 'start' });
+  const onRoles = roles(on.room, on.players);
+  assert.deepEqual(on.room.viewFor(onRoles.imposters[0]).round.card, { type: 'imposter', hint: 'Naruto' });
+  assert.equal(on.room.viewFor(onRoles.others[0]).round.card.hint, undefined);
+});
+
+test('Titel am Spielende: Wer vorne liegt, bekommt den Titel', () => {
+  const { room, host, players } = setup(4, 1);
+  room.handleAction(host, { type: 'start' });
+  const { imposters, others } = roles(room, players);
+  room.handleAction(others[0], { type: 'sus', target: others[1].id });
+  room.handleAction(host, { type: 'startVote' });
+  voteOut(room, players, imposters[0]);
+  room.handleAction(host, { type: 'showFinal' });
+
+  const { titles } = room.viewFor(host).match;
+  const byName = Object.fromEntries(titles.map((entry) => [entry.title, entry]));
+  assert.deepEqual(new Set(byName.Detektiv.playerIds), new Set(others.map((p) => p.id)));
+  assert.deepEqual(byName.Hauptverdächtig.playerIds, [imposters[0].id]);
+  assert.deepEqual(byName.Paranoid.playerIds, [imposters[0].id], 'der Imposter hat einen Unschuldigen angeklagt');
+  assert.equal(byName['Meister-Bluffer'], undefined, 'ohne Imposter-Sieg kein Titel');
+});
+
+test('Wortlisten: Genug Begriffe, keine Dopplungen, Paare sind verschieden', () => {
+  const WORDS = require('../words');
+  const all = [];
+  for (const [id, entry] of Object.entries(WORDS)) {
+    assert.ok(entry.words.length >= 20, `${id} hat zu wenige Wörter`);
+    assert.equal(new Set(entry.words).size, entry.words.length, `${id} hat doppelte Wörter`);
+    for (const pair of entry.pairs ?? []) {
+      assert.equal(pair.length, 2);
+      assert.notEqual(pair[0], pair[1]);
+    }
+    all.push(...entry.words);
+  }
+  const duplicates = all.filter((word, index) => all.indexOf(word) !== index);
+  assert.deepEqual(duplicates, [], 'kein Begriff steht in zwei Kategorien');
+  for (const id of ['isaac', 'naruto', 'onepiece', 'videospiele', 'anime', 'fashion', 'marken', 'filme', 'fussball']) {
+    assert.ok(WORDS[id], `Kategorie ${id} fehlt`);
+  }
+});
+
 test('Avatare: Nur gültige Werte, jeder Teil lässt sich zeichnen', () => {
   const good = { head: 0, skin: 0, outfit: 0, color: 0, eyes: 0 };
   assert.equal(isValidAvatar(good), true);
@@ -663,7 +776,7 @@ test('Mehrere Imposter: Anzahl lässt sich einstellen und alle sehen sie von Anf
   assert.equal(cards.filter((type) => type === 'word').length, 2);
 
   const { imposters, others } = roles(room, players);
-  const leak = JSON.stringify(room.viewFor(imposters[0]));
+  const leak = JSON.stringify(room.viewFor(imposters[0]).round);
   assert.ok(!leak.includes(`"${room.round.word}"`));
   assert.ok(!leak.includes('imposterIds'), 'Imposter erfahren nicht, wer die anderen sind');
   assert.deepEqual(Object.keys(room.viewFor(imposters[0]).round).sort(), Object.keys(room.viewFor(others[0]).round).sort());
@@ -677,7 +790,7 @@ test('wer während der Runde dazukommt, schaut zu und spielt ab der nächsten mi
 
   const view = room.viewFor(late);
   assert.equal(view.round.card, null);
-  assert.ok(!JSON.stringify(view).includes(`"${room.round.word}"`));
+  assert.ok(!JSON.stringify(view.round).includes(`"${room.round.word}"`));
 
   playRoundWhereImposterIsCaught(room, host, players);
   room.handleAction(host, { type: 'nextRound' });
@@ -707,7 +820,7 @@ test('Host geht: die Rolle wandert weiter', () => {
   assert.equal(room.hostId, players[1].id);
 });
 
-test('Aus demselben Browser kommt man auf seinen Platz zurück', () => {
+test('Mit demselben Konto kommt man auf seinen Platz zurück', () => {
   const account = fakeAccount('Wieder');
   const { room, player: host } = createRoom(fakeAccount('Host'));
   const player = room.addPlayer(account);

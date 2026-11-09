@@ -14,7 +14,15 @@ Wort-Partyspiel für den Browser, gemacht zum Spielen über Discord. Alle bekomm
    Für jedes Wort gibt es 30 Sekunden, danach ist automatisch der Nächste dran. Eingetippte Wörter liest der Browser vor. Mit einem Klick auf einen Mitspieler zeigt man allen, dass man ihn verdächtig findet.
 6. Ein Imposter kann jederzeit das Wort raten. Exakte Treffer und kleine Tippfehler zählen automatisch, über alles andere entscheiden die Spieler, die das Wort kennen (bei Gleichstand zählt der Tipp). Richtig: Die Imposter gewinnen. Falsch: Die Gruppe gewinnt. Beides beendet die Runde sofort.
 7. Sonst startet der Host die Abstimmung, sobald ihr bereit seid. Wer die meisten Stimmen hat, fliegt raus und entscheidet selbst, ob die eigene Rolle gezeigt wird. Bei Gleichstand fliegt niemand raus. Danach spielt ihr weiter, bis alle Imposter draußen sind (die Gruppe gewinnt) oder die Imposter mindestens so viele sind wie die übrigen Spieler (die Imposter gewinnen). Am Ende werden Wort, Imposter und Stimmen aufgedeckt.
-8. Nach der letzten Runde zeigt das Endergebnis, wer gewonnen hat.
+8. Nach der letzten Runde zeigt das Endergebnis, wer gewonnen hat, dazu Titel wie „Detektiv“, „Meister-Bluffer“ oder „Paranoid“.
+
+## Einstellungen in der Lobby
+
+- **Modus Klassisch:** Die Imposter wissen, dass sie Imposter sind, und kennen das Wort nicht.
+- **Modus Undercover:** Die Imposter bekommen ein ähnliches Wort (etwa Hund statt Katze) und wissen selbst nicht, dass sie Imposter sind. Raten gibt es in diesem Modus nicht.
+- **Zeit pro Wort:** 15 bis 90 Sekunden oder ohne Timer.
+- **Imposter sieht die Kategorie:** Hilft dem Imposter vor allem bei „Alle gemischt“ (nur im klassischen Modus).
+- **Imposter sehen sich gegenseitig:** ab 2 Impostern, nur im klassischen Modus.
 
 ## Punkte
 

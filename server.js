@@ -4,9 +4,16 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { GameError } = require('./errors');
-const { identify, createRoom, getRoom, sweepRooms } = require('./game');
+const { createRoom, getRoom, sweepRooms, updateAvatarInRooms, events } = require('./game');
+const { AccountStore } = require('./accounts');
 
 const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+
+const accounts = new AccountStore(path.join(DATA_DIR, 'imposter.db'));
+events.onRound = (entries) => accounts.recordRound(entries);
+events.onMatch = (participants, winners) => accounts.recordMatch(participants, winners);
 const MAX_BODY_BYTES = 4096;
 const HEARTBEAT_MS = 20_000;
 const SWEEP_MS = 5 * 60_000;
@@ -65,6 +72,22 @@ function readJson(req) {
   });
 }
 
+function bearerToken(req) {
+  const header = req.headers.authorization ?? '';
+  return header.startsWith('Bearer ') ? header.slice(7) : null;
+}
+
+function requireAccount(req) {
+  const account = accounts.authenticate(bearerToken(req));
+  if (!account) throw new GameError('Bitte melde dich an.', 401);
+  return account;
+}
+
+// Hinter dem Cloudflare Tunnel steht die echte Adresse des Besuchers in diesem Header.
+function clientIp(req) {
+  return req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unbekannt';
+}
+
 function authenticatePlayer(code, token) {
   const room = getRoom(code);
   const player = room.findByToken(token);
@@ -105,18 +128,56 @@ async function handleApi(req, res, url) {
     openEventStream(req, res, url);
     return;
   }
+  if (req.method === 'GET' && url.pathname === '/api/me') {
+    sendJson(res, 200, { account: accounts.publicAccount(requireAccount(req)) });
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/leaderboard') {
+    sendJson(res, 200, { leaderboard: accounts.leaderboard() });
+    return;
+  }
   if (req.method !== 'POST') throw new GameError('Nicht gefunden.', 404);
 
   const body = await readJson(req);
   switch (url.pathname) {
+    case '/api/register': {
+      const { token, account } = await accounts.register(body.username, body.password, body.avatar, clientIp(req));
+      sendJson(res, 201, { token, account: accounts.publicAccount(account) });
+      return;
+    }
+    case '/api/login': {
+      const { token, account } = await accounts.login(body.username, body.password);
+      sendJson(res, 200, { token, account: accounts.publicAccount(account) });
+      return;
+    }
+    case '/api/logout': {
+      accounts.logout(bearerToken(req));
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    case '/api/avatar': {
+      const account = requireAccount(req);
+      accounts.setAvatar(account, body.avatar);
+      updateAvatarInRooms(account.id, account.avatar);
+      sendJson(res, 200, { account: accounts.publicAccount(account) });
+      return;
+    }
+    case '/api/password': {
+      const account = requireAccount(req);
+      await accounts.changePassword(account, body.oldPassword, body.newPassword);
+      // Alle Anmeldungen wurden beendet, dieses Gerät bekommt sofort eine neue.
+      sendJson(res, 200, { token: accounts.createSession(account.id) });
+      return;
+    }
     case '/api/create': {
-      const { room, player } = createRoom(identify(body));
+      const { room, player } = createRoom(requireAccount(req));
       sendJson(res, 201, { code: room.code, token: player.token });
       return;
     }
     case '/api/join': {
+      const account = requireAccount(req);
       const room = getRoom(body.code);
-      const player = room.addPlayer(identify(body));
+      const player = room.addPlayer(account);
       sendJson(res, 200, { code: room.code, token: player.token });
       return;
     }
@@ -192,6 +253,13 @@ const server = http.createServer(async (req, res) => {
 
 setInterval(sweepRooms, SWEEP_MS).unref();
 
-server.listen(PORT, () => {
-  console.log(`Imposter läuft auf http://localhost:${PORT}`);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    accounts.close();
+    process.exit(0);
+  });
+}
+
+server.listen(PORT, HOST, () => {
+  console.log(`Imposter läuft auf http://localhost:${PORT} (Daten in ${DATA_DIR})`);
 });

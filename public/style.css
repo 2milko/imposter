@@ -114,6 +114,19 @@ svg.avatar { display: block; flex: none; border-radius: 50%; }
 .account-bar-name { font-size: 1.25rem; font-weight: 700; overflow-wrap: anywhere; }
 .account-bar-text { display: grid; justify-items: start; gap: .1rem; min-width: 0; flex: 1 1 8rem; }
 .link-row { display: flex; flex-wrap: wrap; justify-content: center; gap: .25rem 1rem; }
+.link-row-start { justify-content: flex-start; }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; padding: .3rem; background: var(--surface-sunken); border-radius: var(--radius-small); }
+.tab {
+  min-height: 2.5rem;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  font-weight: 700;
+}
+.tab.is-active { color: var(--text); background: var(--surface-strong); }
+.auth-form { display: grid; gap: 1rem; }
+.board-sub { display: block; color: var(--muted); font-size: .78rem; font-weight: 500; }
 
 /* Formulare */
 .field { display: grid; gap: .4rem; min-width: 0; }
@@ -245,7 +258,31 @@ button { font: inherit; cursor: pointer; color: inherit; }
   border-radius: var(--radius-small);
 }
 .settings { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.7fr); gap: .6rem; }
+.settings-two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .settings-readout { color: var(--muted); }
+.card-front-category {
+  padding: .1rem .7rem;
+  background: rgb(255 255 255 / .2);
+  border-radius: 99px;
+  font-size: .9rem;
+  font-weight: 700;
+}
+.titles { display: grid; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: .8rem;
+  padding: .55rem .8rem .55rem .55rem;
+  background: var(--surface-sunken);
+  border: 1px solid transparent;
+  border-radius: var(--radius-small);
+}
+.title-row.is-you { border-color: var(--highlight); }
+.title-avatars { display: flex; flex: none; }
+.title-avatars svg + svg { margin-left: -12px; }
+.title-main { display: grid; gap: .05rem; min-width: 0; }
+.title-name { color: var(--highlight); font-size: 1.05rem; font-weight: 800; }
+.title-who { font-weight: 700; overflow-wrap: anywhere; }
 .settings-readout b { color: var(--text); font-weight: 700; }
 
 .imposter-count {
